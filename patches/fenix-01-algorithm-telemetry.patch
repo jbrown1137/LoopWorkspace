@@ -289,9 +289,9 @@ index 9dbbce3..69a52c7 100644
 +        var telemetry: [String: JSONValue] = [
 +            "fenixTelemetryVersion": .number(1),
 +            "momentumApplied": bool(effects.momentumApplied),
-+            "momentumNet": number(effects.momentum.netEffect()?.quantity.doubleValue(for: .milligramsPerDeciliter)),
++            "momentumNet": number(effects.momentum.netEffect()?.mgdl),
 +            "retrospectiveCorrectionApplied": bool(effects.retrospectiveCorrectionApplied),
-+            "retrospectiveCorrectionNet": number(effects.retrospectiveCorrection.netEffect()?.quantity.doubleValue(for: .milligramsPerDeciliter)),
++            "retrospectiveCorrectionNet": number(effects.retrospectiveCorrection.netEffect()?.mgdl),
 +            "retrospectiveCorrectionTotal": number(effects.totalRetrospectiveCorrectionEffect),
 +            "includePositiveVelocityAndRC": .bool(input.includePositiveVelocityAndRC),
 +            "displayOnlyCount30m": .number(Double(recent.filter(\.isDisplayOnly).count)),
