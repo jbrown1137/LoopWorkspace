@@ -1,0 +1,522 @@
+Fenix: LibreLoop 'Dose from check-BG readings' switch, DEFAULT OFF (dosing change; SAFETY rules 1-5).
+LibreLoop 57853f3. Remove this file to remove the feature.
+
+diff --git a/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManager.swift b/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManager.swift
+index 49a2150..9777330 100644
+--- a/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManager.swift
++++ b/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManager.swift
+@@ -331,12 +331,14 @@ public final class LibreLoopCGMManager: CGMManager {
+     func recordForwardingOutcome(
+         forLifeCount lifeCount: UInt16,
+         wasForwarded: Bool,
+-        skipReason: String?
++        skipReason: String?,
++        forwardedForDosingFromCheckBG: Bool = false
+     ) {
+         guard let idx = recentSamples.firstIndex(where: { $0.lifeCount == lifeCount }) else { return }
+         let updatedSample = recentSamples[idx].withForwardingOutcome(
+             wasForwarded: wasForwarded,
+-            skipReason: skipReason
++            skipReason: skipReason,
++            forwardedForDosingFromCheckBG: forwardedForDosingFromCheckBG
+         )
+         recentSamples[idx] = updatedSample
+         var updated = state
+@@ -411,6 +413,16 @@ public final class LibreLoopCGMManager: CGMManager {
+         setState(updated)
+     }
+ 
++    /// Fenix: "Dose from check-BG readings" (default off). UI must only call
++    /// this with `enabled: true` after the user confirmed the explanation.
++    /// Takes effect from the next reading; readings already sent keep their flag.
++    public func setDoseFromCheckBGReadings(_ enabled: Bool) {
++        var updated = state
++        updated.doseFromCheckBGReadings = enabled
++        setState(updated)
++        llog("dose from check-BG readings: \(enabled ? "ON" : "OFF")")
++    }
++
+     public let isOnboarded = true
+ 
+     public var appURL: URL? { nil }
+diff --git a/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManagerState.swift b/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManagerState.swift
+index 50198ea..e276e97 100644
+--- a/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManagerState.swift
++++ b/LibreLoop/LibreLoop/LibreLoopCGMManager/LibreLoopCGMManagerState.swift
+@@ -51,6 +51,16 @@ public struct LibreLoopCGMManagerState: RawRepresentable, Equatable {
+     /// default — flipping it on requires reading a warning sheet that
+     /// explains the dosing-cadence implications first.
+     public var experimentalMinuteByMinuteForwarding: Bool = false
++    /// Fenix: "Dose from check-BG readings". Default OFF. When on, a reading
++    /// whose only issue is the sensor's not-actionable bit is forwarded to Loop
++    /// as a dosing reading instead of display-only. See
++    /// `LibreLoopCheckBGDosingPolicy`. Kept across sensor changes (it is a
++    /// setting, not sensor state); missing in rawState = off.
++    public var doseFromCheckBGReadings: Bool = false
++
++    public var checkBGDosingPolicy: LibreLoopCheckBGDosingPolicy {
++        LibreLoopCheckBGDosingPolicy(doseFromCheckBGReadings: doseFromCheckBGReadings)
++    }
+     /// Total sensor wear duration in minutes, as reported by the sensor's
+     /// NFC patch-info at pairing time. Nil for state persisted before this
+     /// field was added; callers fall back to the 14-day spec default in
+@@ -139,6 +149,7 @@ public struct LibreLoopCGMManagerState: RawRepresentable, Equatable {
+         }
+         self.latestForwardedToLoopAt = rawValue["latestForwardedToLoopAt"] as? Date
+         self.experimentalMinuteByMinuteForwarding = rawValue["experimentalMinuteByMinuteForwarding"] as? Bool ?? false
++        self.doseFromCheckBGReadings = rawValue["doseFromCheckBGReadings"] as? Bool ?? false
+         self.wearDurationMinutes = rawValue["wearDurationMinutes"] as? Int
+         self.warmupDurationMinutes = rawValue["warmupDurationMinutes"] as? Int
+         self.generation = (rawValue["generation"] as? Int).map { UInt16(clamping: $0) }
+@@ -173,6 +184,9 @@ public struct LibreLoopCGMManagerState: RawRepresentable, Equatable {
+         if experimentalMinuteByMinuteForwarding {
+             raw["experimentalMinuteByMinuteForwarding"] = true
+         }
++        if doseFromCheckBGReadings {
++            raw["doseFromCheckBGReadings"] = true
++        }
+         raw["wearDurationMinutes"] = wearDurationMinutes
+         raw["warmupDurationMinutes"] = warmupDurationMinutes
+         raw["generation"] = generation.map { Int($0) }
+diff --git a/LibreLoop/LibreLoop/Pairing/LibreLoopCGMManager+Pairing.swift b/LibreLoop/LibreLoop/Pairing/LibreLoopCGMManager+Pairing.swift
+index cca959c..b5ce63a 100644
+--- a/LibreLoop/LibreLoop/Pairing/LibreLoopCGMManager+Pairing.swift
++++ b/LibreLoop/LibreLoop/Pairing/LibreLoopCGMManager+Pairing.swift
+@@ -595,7 +595,11 @@ extension LibreLoopCGMManager {
+         // Status detail moves out of "Waiting for first reading" the instant
+         // any reading arrives, even unactionable ones -- the link is proven.
+         if !sample.isActionable {
+-            updateStatusDetail("Reading received (display only)")
++            if state.checkBGDosingPolicy.usesCheckBGForDosing(sample) {
++                updateStatusDetail("Reading received (check BG, used for dosing)")
++            } else {
++                updateStatusDetail("Reading received (display only)")
++            }
+         } else {
+             updateStatusDetail(nil)
+         }
+@@ -623,7 +627,12 @@ extension LibreLoopCGMManager {
+             return
+         }
+ 
+-        let isDisplayOnly = !sample.isActionable
++        // Fenix: stock is `!sample.isActionable`. With "Dose from check-BG
++        // readings" on, a reading whose ONLY issue is the not-actionable bit is
++        // forwarded as a dosing reading; with it off this is exactly stock.
++        let checkBGPolicy = state.checkBGDosingPolicy
++        let isDisplayOnly = checkBGPolicy.forwardsAsDisplayOnly(sample)
++        let usesCheckBGForDosing = checkBGPolicy.usesCheckBGForDosing(sample)
+ 
+         if !state.experimentalMinuteByMinuteForwarding,
+            let last = state.latestForwardedToLoopAt,
+@@ -668,7 +677,7 @@ extension LibreLoopCGMManager {
+             device: device
+         )
+ 
+-        let displayTag = isDisplayOnly ? " (display-only)" : ""
++        let displayTag = isDisplayOnly ? " (display-only)" : (usesCheckBGForDosing ? " (check BG, dosing: switch on)" : "")
+         llog("forwarding to Loop\(displayTag): \(Int(sample.valueMgDL)) mg/dL lifeCount=\(sample.lifeCount) sampleDate=\(sample.date.timeIntervalSince1970)")
+         // Advance the throttle clock on every forward — actionable or
+         // display-only — so the ~5-min cadence also holds through a warmup
+@@ -678,7 +687,8 @@ extension LibreLoopCGMManager {
+         var stamped = state
+         stamped.latestForwardedToLoopAt = sample.date
+         setState(stamped)
+-        recordForwardingOutcome(forLifeCount: sample.lifeCount, wasForwarded: true, skipReason: nil)
++        recordForwardingOutcome(forLifeCount: sample.lifeCount, wasForwarded: true, skipReason: nil,
++                                forwardedForDosingFromCheckBG: usesCheckBGForDosing)
+ 
+         cgmDelegate.notify { [weak self] delegate in
+             guard let self else { return }
+diff --git a/LibreLoop/LibreLoop/Sensor/LibreLoopGlucoseSample.swift b/LibreLoop/LibreLoop/Sensor/LibreLoopGlucoseSample.swift
+index 5f5d3fe..cedb308 100644
+--- a/LibreLoop/LibreLoop/Sensor/LibreLoopGlucoseSample.swift
++++ b/LibreLoop/LibreLoop/Sensor/LibreLoopGlucoseSample.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import RoundWhiteDiscKit
+ 
+ /// A glucose reading produced by the LibreLoop CGM. Wraps RoundWhiteDiscKit's
+ /// realtime reading so callers (UI, the manager itself, tests) don't need
+@@ -52,6 +53,13 @@ public struct LibreLoopGlucoseSample: Equatable, Sendable {
+     /// sending them to Loop as display-only -- showing a value
+     /// the sensor itself called bad would be misleading.
+     public let hasBlockingIssue: Bool
++    /// Fenix: true when the sensor's advisory not-actionable bit ("check BG",
++    /// shown as "Display only") is the ONLY issue on this reading -- no warmup,
++    /// expiry, DQ error, sensor-condition fault or unavailable value. Set from
++    /// the quality assessment by `onlyIssueIsNotActionable(_:)`. This is the
++    /// only kind of reading the "Dose from check-BG readings" switch can
++    /// change; see `LibreLoopCheckBGDosingPolicy`.
++    public let onlyIssueIsNotActionable: Bool
+     /// Range-censoring marker -- nil when `valueMgDL` is a normal in-range
+     /// reading, `.belowRange` when the sensor pegged display at the low
+     /// cap (39 mg/dL), `.aboveRange` at the high cap (501 mg/dL).
+@@ -70,6 +78,9 @@ public struct LibreLoopGlucoseSample: Equatable, Sendable {
+     /// false (e.g. "Throttled (4.5 min)", "Not actionable: warming up").
+     /// nil when forwarded or before the gate has run.
+     public let forwardSkipReason: String?
++    /// Fenix: true when this check-BG reading was forwarded to Loop as a dosing
++    /// reading (isDisplayOnly = false) because "Dose from check-BG readings" was on.
++    public let forwardedForDosingFromCheckBG: Bool
+ 
+     public init(
+         date: Date,
+@@ -80,11 +91,13 @@ public struct LibreLoopGlucoseSample: Equatable, Sendable {
+         sensorTemperatureRaw: UInt16,
+         isActionable: Bool,
+         hasBlockingIssue: Bool = false,
++        onlyIssueIsNotActionable: Bool = false,
+         condition: Condition? = nil,
+         qualityIssue: String? = nil,
+         source: Source = .realtime,
+         wasForwarded: Bool = false,
+-        forwardSkipReason: String? = nil
++        forwardSkipReason: String? = nil,
++        forwardedForDosingFromCheckBG: Bool = false
+     ) {
+         self.date = date
+         self.valueMgDL = valueMgDL
+@@ -94,18 +107,21 @@ public struct LibreLoopGlucoseSample: Equatable, Sendable {
+         self.sensorTemperatureRaw = sensorTemperatureRaw
+         self.isActionable = isActionable
+         self.hasBlockingIssue = hasBlockingIssue
++        self.onlyIssueIsNotActionable = onlyIssueIsNotActionable
+         self.condition = condition
+         self.qualityIssue = qualityIssue
+         self.source = source
+         self.wasForwarded = wasForwarded
+         self.forwardSkipReason = forwardSkipReason
++        self.forwardedForDosingFromCheckBG = forwardedForDosingFromCheckBG
+     }
+ 
+     /// Return a copy with the forwarding outcome filled in. Called from
+     /// `ingest(_:)` after the throttle/actionability gate decides.
+     public func withForwardingOutcome(
+         wasForwarded: Bool,
+-        skipReason: String?
++        skipReason: String?,
++        forwardedForDosingFromCheckBG: Bool = false
+     ) -> LibreLoopGlucoseSample {
+         LibreLoopGlucoseSample(
+             date: date,
+@@ -116,11 +132,13 @@ public struct LibreLoopGlucoseSample: Equatable, Sendable {
+             sensorTemperatureRaw: sensorTemperatureRaw,
+             isActionable: isActionable,
+             hasBlockingIssue: hasBlockingIssue,
++            onlyIssueIsNotActionable: onlyIssueIsNotActionable,
+             condition: condition,
+             qualityIssue: qualityIssue,
+             source: source,
+             wasForwarded: wasForwarded,
+-            forwardSkipReason: skipReason
++            forwardSkipReason: skipReason,
++            forwardedForDosingFromCheckBG: wasForwarded && forwardedForDosingFromCheckBG
+         )
+     }
+ }
+@@ -154,6 +172,8 @@ extension LibreLoopGlucoseSample {
+         self.forwardSkipReason = rawValue["fr"] as? String
+         self.condition = (rawValue["c"] as? String).flatMap(Condition.init(rawString:))
+         self.hasBlockingIssue = rawValue["bi"] as? Bool ?? false
++        self.onlyIssueIsNotActionable = rawValue["na"] as? Bool ?? false
++        self.forwardedForDosingFromCheckBG = rawValue["cbd"] as? Bool ?? false
+     }
+ 
+     var rawValue: [String: Any] {
+@@ -172,6 +192,8 @@ extension LibreLoopGlucoseSample {
+         raw["fr"] = forwardSkipReason
+         raw["c"] = condition?.rawString
+         if hasBlockingIssue { raw["bi"] = true }
++        if onlyIssueIsNotActionable { raw["na"] = true }
++        if forwardedForDosingFromCheckBG { raw["cbd"] = true }
+         return raw
+     }
+ }
+@@ -212,6 +234,66 @@ extension LibreLoopGlucoseSample.Source {
+     }
+ }
+ 
++// MARK: - Fenix: "Dose from check-BG readings"
++
++extension LibreLoopGlucoseSample {
++    /// True when the sensor's advisory not-actionable bit is the only issue:
++    /// at least one issue, and every issue is `.notActionable`. Any warmup,
++    /// expiry, DQ error, sensor-condition fault or unavailable value -> false.
++    /// Written against the issue cases themselves (not `isAdvisory`) so a new
++    /// advisory kind added upstream can never be swept in by accident.
++    public static func onlyIssueIsNotActionable(_ issues: [Libre3GlucoseQualityIssue]) -> Bool {
++        guard !issues.isEmpty else { return false }
++        return issues.allSatisfy { issue in
++            if case .notActionable = issue { return true }
++            return false
++        }
++    }
++}
++
++/// Fenix: how a realtime reading maps to Loop's `isDisplayOnly`.
++///
++/// Switch OFF (the default): exactly stock LibreLoop -- any reading that is not
++/// fully actionable is forwarded display-only.
++///
++/// Switch ON: a reading whose ONLY issue is the sensor's not-actionable bit
++/// ("check BG"; on Jeff's Libre 3 Plus it is set for the first 12 h after
++/// sensor start) and that is an in-range realtime value is forwarded as a normal
++/// dosing reading. Everything else is unchanged: readings with a blocking issue
++/// are still dropped before this is asked, pegged 39/501 values and backfill
++/// keep their stock handling, and Loop's own limits (max bolus, max basal,
++/// suspend threshold, IOB limit) are untouched by this code.
++///
++/// Extension point (NOT implemented, Jeff has not chosen one): a first-12-h guard
++/// would be one more stored property here, consulted in `usesCheckBGForDosing`
++/// or in a richer return type, e.g. "only while sensor age >= N h", or "flag the
++/// sample so Loop allows only negative momentum/RC". Any guard must only ever
++/// make the result MORE conservative than switch-on.
++public struct LibreLoopCheckBGDosingPolicy: Equatable, Sendable {
++    public var doseFromCheckBGReadings: Bool
++
++    public init(doseFromCheckBGReadings: Bool) {
++        self.doseFromCheckBGReadings = doseFromCheckBGReadings
++    }
++
++    /// True when the switch turns this reading from display-only into a dosing reading.
++    public func usesCheckBGForDosing(_ sample: LibreLoopGlucoseSample) -> Bool {
++        doseFromCheckBGReadings
++            && !sample.isActionable
++            && sample.onlyIssueIsNotActionable
++            && !sample.hasBlockingIssue
++            && sample.condition == nil
++            && sample.source == .realtime
++    }
++
++    /// The `isDisplayOnly` value to forward to Loop for a realtime reading that
++    /// passed the blocking-issue check.
++    public func forwardsAsDisplayOnly(_ sample: LibreLoopGlucoseSample) -> Bool {
++        if sample.isActionable { return false }
++        return !usesCheckBGForDosing(sample)
++    }
++}
++
+ // MARK: - Debug stream capture
+ //
+ // In-memory only (never persisted). Used by the developer "Glucose Streams"
+diff --git a/LibreLoop/LibreLoop/Sensor/LibreLoopSensorMonitor.swift b/LibreLoop/LibreLoop/Sensor/LibreLoopSensorMonitor.swift
+index d6cd42e..35efee8 100644
+--- a/LibreLoop/LibreLoop/Sensor/LibreLoopSensorMonitor.swift
++++ b/LibreLoop/LibreLoop/Sensor/LibreLoopSensorMonitor.swift
+@@ -645,6 +645,7 @@ public final class LibreLoopSensorMonitor: @unchecked Sendable {
+             sensorTemperatureRaw: reading.temperature,
+             isActionable: isActionable,
+             hasBlockingIssue: hasBlockingIssue,
++            onlyIssueIsNotActionable: LibreLoopGlucoseSample.onlyIssueIsNotActionable(assessment.issues),
+             condition: condition,
+             qualityIssue: describeIssues(assessment.issues)
+         )
+diff --git a/LibreLoop/LibreLoopTests/LibreLoopCGMManagerStateTests.swift b/LibreLoop/LibreLoopTests/LibreLoopCGMManagerStateTests.swift
+index bec5960..07deec6 100644
+--- a/LibreLoop/LibreLoopTests/LibreLoopCGMManagerStateTests.swift
++++ b/LibreLoop/LibreLoopTests/LibreLoopCGMManagerStateTests.swift
+@@ -292,6 +292,100 @@ final class LibreLoopRecentReadingsTests: XCTestCase {
+     }
+ }
+ 
++// Fenix: "Dose from check-BG readings" mapping (default off = stock).
++final class LibreLoopCheckBGDosingPolicyTests: XCTestCase {
++    private let date = Date(timeIntervalSince1970: 1_700_000_000)
++
++    private func sample(issues: [Libre3GlucoseQualityIssue],
++                        condition: LibreLoopGlucoseSample.Condition? = nil,
++                        source: LibreLoopGlucoseSample.Source = .realtime) -> LibreLoopGlucoseSample {
++        LibreLoopGlucoseSample(
++            date: date,
++            valueMgDL: 220,
++            trend: .stable,
++            rateOfChangeMgDLPerMinute: 0.5,
++            lifeCount: 300,
++            sensorTemperatureRaw: 0,
++            isActionable: issues.isEmpty,
++            hasBlockingIssue: issues.contains { $0.isUsabilityBlocking },
++            onlyIssueIsNotActionable: LibreLoopGlucoseSample.onlyIssueIsNotActionable(issues),
++            condition: condition,
++            source: source
++        )
++    }
++
++    private let off = LibreLoopCheckBGDosingPolicy(doseFromCheckBGReadings: false)
++    private let on = LibreLoopCheckBGDosingPolicy(doseFromCheckBGReadings: true)
++    private let checkBG: Libre3GlucoseQualityIssue = .notActionable(.notActionable)
++
++    func testDefaultIsOff() {
++        XCTAssertFalse(LibreLoopCGMManagerState().doseFromCheckBGReadings)
++        XCTAssertFalse(LibreLoopCGMManagerState(rawValue: [:])!.doseFromCheckBGReadings)
++    }
++
++    func testSwitchPersists() {
++        var state = LibreLoopCGMManagerState()
++        XCTAssertNil(state.rawValue["doseFromCheckBGReadings"])
++        state.doseFromCheckBGReadings = true
++        XCTAssertEqual(LibreLoopCGMManagerState(rawValue: state.rawValue)?.doseFromCheckBGReadings, true)
++    }
++
++    func testCleanReadingDosesEitherWay() {
++        let clean = sample(issues: [])
++        XCTAssertFalse(off.forwardsAsDisplayOnly(clean))
++        XCTAssertFalse(on.forwardsAsDisplayOnly(clean))
++        XCTAssertFalse(on.usesCheckBGForDosing(clean))
++    }
++
++    func testCheckBGOnlyIsDisplayOnlyWhenOffAndDosingWhenOn() {
++        let flagged = sample(issues: [checkBG])
++        XCTAssertTrue(flagged.onlyIssueIsNotActionable)
++        XCTAssertTrue(off.forwardsAsDisplayOnly(flagged))
++        XCTAssertFalse(off.usesCheckBGForDosing(flagged))
++        XCTAssertFalse(on.forwardsAsDisplayOnly(flagged))
++        XCTAssertTrue(on.usesCheckBGForDosing(flagged))
++    }
++
++    func testAnyOtherIssueKeepsStockHandlingWithSwitchOn() {
++        let others: [[Libre3GlucoseQualityIssue]] = [
++            [.sensorWarmup(remainingMinutes: 20), checkBG],
++            [.sensorExpired, checkBG],
++            [.currentGlucoseUnavailable(.unavailable(raw: 0)), checkBG],
++            [.currentDataQuality(.sensorTooHot(rawValue: 1)), checkBG],
++            [.sensorCondition(.invalid), checkBG],
++            [.sensorCondition(.esa)],
++        ]
++        for issues in others {
++            let s = sample(issues: issues)
++            XCTAssertFalse(s.onlyIssueIsNotActionable, "\(issues)")
++            XCTAssertFalse(on.usesCheckBGForDosing(s), "\(issues)")
++            XCTAssertTrue(on.forwardsAsDisplayOnly(s), "\(issues)")
++            XCTAssertEqual(on.forwardsAsDisplayOnly(s), off.forwardsAsDisplayOnly(s), "\(issues)")
++        }
++    }
++
++    func testPeggedOrBackfilledCheckBGReadingStaysDisplayOnly() {
++        XCTAssertTrue(on.forwardsAsDisplayOnly(sample(issues: [checkBG], condition: .aboveRange)))
++        XCTAssertTrue(on.forwardsAsDisplayOnly(sample(issues: [checkBG], condition: .belowRange)))
++        XCTAssertFalse(on.usesCheckBGForDosing(sample(issues: [checkBG], source: .historicalBackfill)))
++    }
++
++    func testNoIssuesIsNotCheckBG() {
++        XCTAssertFalse(LibreLoopGlucoseSample.onlyIssueIsNotActionable([]))
++    }
++
++    func testForwardingOutcomeAndRawValueKeepTheFlags() {
++        let flagged = sample(issues: [checkBG])
++        let forwarded = flagged.withForwardingOutcome(wasForwarded: true, skipReason: nil, forwardedForDosingFromCheckBG: true)
++        XCTAssertTrue(forwarded.forwardedForDosingFromCheckBG)
++        XCTAssertFalse(flagged.withForwardingOutcome(wasForwarded: false, skipReason: "Throttled", forwardedForDosingFromCheckBG: true).forwardedForDosingFromCheckBG)
++        let restored = LibreLoopGlucoseSample(rawValue: forwarded.rawValue)
++        XCTAssertEqual(restored?.onlyIssueIsNotActionable, true)
++        XCTAssertEqual(restored?.forwardedForDosingFromCheckBG, true)
++        XCTAssertEqual(LibreLoopGlucoseSample(rawValue: sample(issues: []).rawValue)?.onlyIssueIsNotActionable, false)
++    }
++}
++
+ final class LibreLoopNFCFailureTests: XCTestCase {
+     // A Libre 3 Plus scanned after its wear: patch state 06, and a8 answered with a5 01 b0.
+     private static let terminatedPatchInfo = "00a50001000200010060541e020401040c0630545041304d514836fe98"
+diff --git a/LibreLoop/LibreLoopUI/Views/LibreLoopSettingsView.swift b/LibreLoop/LibreLoopUI/Views/LibreLoopSettingsView.swift
+index bdf053d..698cf24 100644
+--- a/LibreLoop/LibreLoopUI/Views/LibreLoopSettingsView.swift
++++ b/LibreLoop/LibreLoopUI/Views/LibreLoopSettingsView.swift
+@@ -16,6 +16,7 @@ struct LibreLoopSettingsView: View {
+     @State private var confirmingReplace = false
+     @State private var showingAllReadings = false
+     @State private var showingMinuteByMinuteWarning = false
++    @State private var confirmingCheckBGDosing = false
+     @State private var activityFilter: ActivityFilter = .all
+     @State private var showingAllActivity = false
+     @State private var copyToast: String?
+@@ -73,6 +74,15 @@ struct LibreLoopSettingsView: View {
+                 onCancel: { showingMinuteByMinuteWarning = false }
+             )
+         }
++        // Fenix: confirm before "Dose from check-BG readings" turns on (List level, like the sheet above).
++        .confirmationDialog(LocalizedString("Dose from check-BG readings?", comment: "Fenix: check-BG dosing confirmation title"), isPresented: $confirmingCheckBGDosing, titleVisibility: .visible) {
++            Button(LocalizedString("Turn On", comment: "Fenix: confirm turning on check-BG dosing")) {
++                viewModel.setDoseFromCheckBGReadings(true)
++            }
++            Button(LocalizedString("Cancel", comment: "Cancel button"), role: .cancel) { }
++        } message: {
++            Text(String(format: LocalizedString("The sensor marks some readings \"check BG\" (shown as Display only), for example during its first 12 hours. With this on, %1$@ doses from those readings like any other, including trend and retrospective correction. Readings with a sensor fault, warmup, expiry or an out-of-range value are still never used. %1$@'s max bolus, max basal, suspend threshold and IOB limit are unchanged.", comment: "Fenix: check-BG dosing confirmation message (1: appName)"), appName))
++        }
+         .onAppear { viewModel.subscribe() }
+         .onDisappear { viewModel.unsubscribe() }
+     }
+@@ -270,7 +280,15 @@ struct LibreLoopSettingsView: View {
+                     }
+                 }
+                 .font(.footnote)
+-                if !sample.isActionable {
++                if !sample.isActionable && sample.forwardedForDosingFromCheckBG {
++                    // Fenix: the sensor flagged this reading "check BG", and
++                    // it was sent to Loop as a dosing reading because the
++                    // switch is on. Make that impossible to miss.
++                    Label(LocalizedString("Check BG reading, used for dosing (Dose from check-BG readings is on)", comment: "Fenix: last reading is a check-BG reading used for dosing because the switch is on"),
++                          systemImage: "exclamationmark.triangle.fill")
++                        .font(.footnote)
++                        .foregroundStyle(.orange)
++                } else if !sample.isActionable {
+                     // Informational, not a warning: the sensor sent a
+                     // value that's forwarded to Loop as isDisplayOnly --
+                     // shown on the chart but not used for dosing math.
+@@ -490,6 +508,22 @@ struct LibreLoopSettingsView: View {
+                  : String(format: LocalizedString("Only one reading every ~5 minutes is sent to %1$@, matching the cadence other CGMs use.", comment: "Forwarding footer: minute-by-minute off (1: appName)"), appName))
+                 .font(.caption)
+                 .foregroundStyle(.secondary)
++            // Fenix: "Dose from check-BG readings" (default off).
++            Toggle(LocalizedString("Dose from check-BG readings", comment: "Fenix: toggle to dose from readings the sensor marks check BG"), isOn: Binding(
++                get: { viewModel.doseFromCheckBGReadingsEnabled },
++                set: { newValue in
++                    if newValue {
++                        confirmingCheckBGDosing = true
++                    } else {
++                        viewModel.setDoseFromCheckBGReadings(false)
++                    }
++                }
++            ))
++            Text(viewModel.doseFromCheckBGReadingsEnabled
++                 ? String(format: LocalizedString("On: readings the sensor marks \"check BG\" are sent to %1$@ for dosing. Sensor faults, warmup, expiry and out-of-range values are still never used.", comment: "Fenix: check-BG dosing footer when on (1: appName)"), appName)
++                 : String(format: LocalizedString("Off: readings the sensor marks \"check BG\" are shown in %1$@ but not used for dosing (standard).", comment: "Fenix: check-BG dosing footer when off (1: appName)"), appName))
++                .font(.caption)
++                .foregroundStyle(viewModel.doseFromCheckBGReadingsEnabled ? .orange : .secondary)
+         }
+     }
+ 
+@@ -694,6 +728,7 @@ final class LibreLoopSettingsViewModel: ObservableObject, LibreLoopStateObserver
+     @Published private(set) var region: String?
+     @Published private(set) var pairedWith: String?
+     @Published private(set) var minuteByMinuteForwardingEnabled: Bool
++    @Published private(set) var doseFromCheckBGReadingsEnabled: Bool
+ 
+     init(cgmManager: LibreLoopCGMManager) {
+         self.cgmManager = cgmManager
+@@ -716,6 +751,7 @@ final class LibreLoopSettingsViewModel: ObservableObject, LibreLoopStateObserver
+         self.region = cgmManager.state.region.map(Self.regionName)
+         self.pairedWith = cgmManager.pairedWith
+         self.minuteByMinuteForwardingEnabled = cgmManager.state.experimentalMinuteByMinuteForwarding
++        self.doseFromCheckBGReadingsEnabled = cgmManager.state.doseFromCheckBGReadings
+     }
+ 
+     /// Region codes as DiaBLE names them, with the raw code kept for reports.
+@@ -733,6 +769,10 @@ final class LibreLoopSettingsViewModel: ObservableObject, LibreLoopStateObserver
+         cgmManager.setExperimentalMinuteByMinuteForwarding(enabled)
+     }
+ 
++    func setDoseFromCheckBGReadings(_ enabled: Bool) {
++        cgmManager.setDoseFromCheckBGReadings(enabled)
++    }
++
+     @MainActor
+     func makeStreamDebugViewModel() -> LibreLoopStreamDebugViewModel {
+         LibreLoopStreamDebugViewModel(cgmManager: cgmManager)
+@@ -782,6 +822,7 @@ final class LibreLoopSettingsViewModel: ObservableObject, LibreLoopStateObserver
+             self.region = state.region.map(Self.regionName)
+             self.pairedWith = manager.pairedWith
+             self.minuteByMinuteForwardingEnabled = state.experimentalMinuteByMinuteForwarding
++            self.doseFromCheckBGReadingsEnabled = state.doseFromCheckBGReadings
+         }
+     }
+ }

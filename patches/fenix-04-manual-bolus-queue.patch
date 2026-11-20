@@ -1,0 +1,736 @@
+Fenix: manual bolus queue behind Loop's automatic bolus (ROADMAP E), DEFAULT OFF. Delivery-time checks; 10-min expiry; one at a time.
+Loop 6990c67. Remove this file to remove the feature.
+
+diff --git a/Loop/Loop/Managers/LoopDataManager.swift b/Loop/Loop/Managers/LoopDataManager.swift
+index 185779a..ed36fd8 100644
+--- a/Loop/Loop/Managers/LoopDataManager.swift
++++ b/Loop/Loop/Managers/LoopDataManager.swift
+@@ -12,6 +12,8 @@ import LoopKit
+ import LoopAlgorithm
+ import LoopKitUI
+ import LoopCore
++import UserNotifications
++import UIKit
+ import WidgetKit
+ 
+ 
+@@ -34,6 +36,9 @@ final class LoopDataManager: ObservableObject {
+     // Represents the current state of the loop algorithm for display
+     var displayState = AlgorithmDisplayState()
+ 
++    /// Fenix: manual bolus queue (default off; see ManualBolusQueueController).
++    lazy var fenixManualBolusQueue = ManualBolusQueueController(loopDataManager: self)
++
+     // Display state convenience accessors
+     var predictedGlucose: [PredictedGlucoseValue]? {
+         displayState.output?.predictedGlucose.map(\.loopKit)
+@@ -918,6 +923,8 @@ extension LoopDataManager: SimpleBolusViewModelDelegate {
+ }
+ 
+ extension LoopDataManager: BolusEntryViewModelDelegate {    
++    var manualBolusQueue: ManualBolusQueueController? { fenixManualBolusQueue }
++
+     func saveGlucose(sample: LoopKit.NewGlucoseSample) async throws -> LoopKit.StoredGlucoseSample {
+         let storedSamples = try await addGlucose([sample])
+         return storedSamples.first!
+@@ -1256,3 +1263,395 @@ extension LoopDataManager: AutomationHistoryProvider {
+         return automationHistory.toTimeline(from: start, to: end)
+     }
+ }
++
++// MARK: - Fenix: manual bolus queue (ROADMAP E). Default OFF.
++//
++// When the pod is busy with an automatic bolus and Jeff asks for a manual one, Loop can ask "Queue your X U to go
++// right after it?" instead of the stock behavior. A queued bolus is delivered once, through the normal manual-bolus
++// path, as soon as the pod is free -- and only if every delivery-time check passes. It is never shrunk, never retried,
++// never delivered later than `ManualBolusQueue.expiry` after queuing.
++
++// FENIX-QUEUE-CORE-BEGIN (pure Foundation; the unit tests exercise this part)
++/// The queue's state machine: one item at most, and the decision of what to do with it at each step.
++struct ManualBolusQueue: Equatable {
++    static let expiry: TimeInterval = 10 * 60
++    /// The glucose used for the check must be at most this old (Loop's own input recency).
++    static let glucoseRecency: TimeInterval = 15 * 60
++
++    struct Item: Equatable {
++        var units: Double
++        var queuedAt: Date
++        var decisionId: UUID?
++        var activationTypeRawValue: String
++    }
++
++    /// What the pod is doing when a bolus is asked for, or when the queue looks again.
++    struct PodSnapshot: Equatable {
++        var hasPod: Bool
++        var isSuspended: Bool
++        /// The pod cannot take a bolus now (one is initiating, running or canceling).
++        var isBusy: Bool
++        /// The running delivery is an automatic bolus (or one is initiating). Only then may a manual bolus queue.
++        var isBusyWithAutomaticDelivery: Bool
++        /// Pod present, not suspended, not inoperable: a bolus could be programmed. Reason when not.
++        var notReadyReason: String?
++    }
++
++    enum QueueRefusal: Error, Equatable {
++        case alreadyQueued
++        case noPod
++        case suspended
++        case notBusyWithAutomaticDelivery
++        case invalidAmount
++    }
++
++    /// The checks a manual bolus gets, re-done when the queued one is about to go.
++    struct DeliveryCheck: Equatable {
++        var maximumBolus: Double?
++        /// Loop's active insulin now, including the automatic bolus that just finished.
++        var activeInsulin: Double?
++        /// Loop's IOB limit multiplier on max bolus (the algorithm's default is 2).
++        var maxActiveInsulinMultiplier: Double = 2
++        var suspendThreshold: Double?
++        var latestGlucose: Double?
++        var latestGlucoseDate: Date?
++        /// Lowest forecast glucose with this bolus included.
++        var minimumForecastWithDose: Double?
++        var pod: PodSnapshot
++    }
++
++    enum GuardFailure: Equatable {
++        case noMaximumBolus
++        case aboveMaximumBolus(maximum: Double)
++        case activeInsulinUnavailable
++        case aboveActiveInsulinLimit(activeInsulin: Double, limit: Double)
++        case noSuspendThreshold
++        case glucoseUnavailable
++        case glucoseBelowSuspendThreshold(glucose: Double, threshold: Double)
++        case forecastUnavailable
++        case forecastBelowSuspendThreshold(forecast: Double, threshold: Double)
++        case podNotReady(String)
++    }
++
++    enum Step: Equatable {
++        case idle
++        case waiting(Item)
++        case deliver(Item)
++        case expired(Item)
++        case notGiven(Item, GuardFailure)
++    }
++
++    private(set) var item: Item?
++
++    @discardableResult
++    mutating func enqueue(units: Double, decisionId: UUID?, activationTypeRawValue: String, at date: Date, pod: PodSnapshot) throws -> Item {
++        guard item == nil else { throw QueueRefusal.alreadyQueued }
++        guard units > 0, units.isFinite else { throw QueueRefusal.invalidAmount }
++        guard pod.hasPod else { throw QueueRefusal.noPod }
++        guard !pod.isSuspended else { throw QueueRefusal.suspended }
++        guard pod.isBusyWithAutomaticDelivery else { throw QueueRefusal.notBusyWithAutomaticDelivery }
++        let newItem = Item(units: units, queuedAt: date, decisionId: decisionId, activationTypeRawValue: activationTypeRawValue)
++        item = newItem
++        return newItem
++    }
++
++    /// Removes the queued bolus; returns it if there was one.
++    @discardableResult
++    mutating func cancel() -> Item? {
++        defer { item = nil }
++        return item
++    }
++
++    /// Expired, or still waiting. Called on every poll before any checks are gathered.
++    mutating func checkExpiry(now: Date) -> Step {
++        guard let item else { return .idle }
++        if now.timeIntervalSince(item.queuedAt) >= Self.expiry {
++            self.item = nil
++            return .expired(item)
++        }
++        return .waiting(item)
++    }
++
++    /// The pod is free: deliver, or say why not. Either way the item leaves the queue -- one attempt only.
++    mutating func stepWhenFree(now: Date, check: DeliveryCheck) -> Step {
++        guard let item else { return .idle }
++        if now.timeIntervalSince(item.queuedAt) >= Self.expiry {
++            self.item = nil
++            return .expired(item)
++        }
++        if check.pod.isBusy {
++            return .waiting(item)
++        }
++        self.item = nil
++        if let failure = Self.guardFailure(units: item.units, now: now, check: check) {
++            return .notGiven(item, failure)
++        }
++        return .deliver(item)
++    }
++
++    static func guardFailure(units: Double, now: Date, check: DeliveryCheck) -> GuardFailure? {
++        if let reason = check.pod.notReadyReason { return .podNotReady(reason) }
++        if !check.pod.hasPod { return .podNotReady("no pod") }
++        if check.pod.isSuspended { return .podNotReady("pod is suspended") }
++
++        guard let maximumBolus = check.maximumBolus else { return .noMaximumBolus }
++        guard units <= maximumBolus + 1e-9 else { return .aboveMaximumBolus(maximum: maximumBolus) }
++
++        guard let activeInsulin = check.activeInsulin else { return .activeInsulinUnavailable }
++        let limit = maximumBolus * check.maxActiveInsulinMultiplier
++        guard activeInsulin + units <= limit + 1e-9 else {
++            return .aboveActiveInsulinLimit(activeInsulin: activeInsulin, limit: limit)
++        }
++
++        guard let threshold = check.suspendThreshold else { return .noSuspendThreshold }
++        guard let glucose = check.latestGlucose, let glucoseDate = check.latestGlucoseDate,
++              now.timeIntervalSince(glucoseDate) <= glucoseRecency, glucoseDate.timeIntervalSince(now) <= glucoseRecency else {
++            return .glucoseUnavailable
++        }
++        guard glucose >= threshold else { return .glucoseBelowSuspendThreshold(glucose: glucose, threshold: threshold) }
++
++        guard let forecast = check.minimumForecastWithDose else { return .forecastUnavailable }
++        guard forecast >= threshold else { return .forecastBelowSuspendThreshold(forecast: forecast, threshold: threshold) }
++        return nil
++    }
++
++    static func describe(_ failure: GuardFailure) -> String {
++        func n(_ value: Double) -> String { String(format: "%.1f", value) }
++        func g(_ value: Double) -> String { String(format: "%.0f", value) }
++        switch failure {
++        case .noMaximumBolus: return "no max bolus is set"
++        case .aboveMaximumBolus(let maximum): return "over max bolus (\(n(maximum)) U)"
++        case .activeInsulinUnavailable: return "active insulin unknown"
++        case .aboveActiveInsulinLimit(let activeInsulin, let limit): return "IOB \(n(activeInsulin)) U would go over the \(n(limit)) U limit"
++        case .noSuspendThreshold: return "no glucose safety limit is set"
++        case .glucoseUnavailable: return "no recent glucose"
++        case .glucoseBelowSuspendThreshold(let glucose, let threshold): return "glucose \(g(glucose)) is below the safety limit \(g(threshold))"
++        case .forecastUnavailable: return "no forecast"
++        case .forecastBelowSuspendThreshold(let forecast, let threshold): return "forecast \(g(forecast)) would go below the safety limit \(g(threshold))"
++        case .podNotReady(let reason): return reason
++        }
++    }
++}
++// FENIX-QUEUE-CORE-END
++
++/// Runs the queue on the phone: the setting, the poll while something is queued, the delivery-time checks,
++/// the send through the normal manual-bolus path, and the notifications.
++@MainActor
++final class ManualBolusQueueController: ObservableObject {
++    static let enabledKey = "com.fenix.queueManualBolusWhenPodBusy"
++    static let pollInterval: TimeInterval = 5
++
++    @Published private(set) var queued: ManualBolusQueue.Item?
++
++    private var queue = ManualBolusQueue()
++    private var pollTask: Task<Void, Never>?
++    private unowned let loopDataManager: LoopDataManager
++    private let log = DiagnosticLog(category: "ManualBolusQueue")
++
++    init(loopDataManager: LoopDataManager) {
++        self.loopDataManager = loopDataManager
++    }
++
++    /// "Queue manual bolus when pod is busy" in Settings. Default OFF; when off everything is stock.
++    var isEnabled: Bool {
++        UserDefaults.standard.bool(forKey: Self.enabledKey)
++    }
++
++    var podSnapshot: ManualBolusQueue.PodSnapshot {
++        let status = loopDataManager.deliveryDelegate?.pumpManagerStatus
++        guard let status else {
++            return .init(hasPod: false, isSuspended: false, isBusy: false, isBusyWithAutomaticDelivery: false, notReadyReason: "no pod")
++        }
++        let isBusy: Bool
++        let isBusyWithAutomatic: Bool
++        switch status.bolusState {
++        case .noBolus:
++            isBusy = false; isBusyWithAutomatic = false
++        case .initiating:
++            // Loop itself starts the only boluses that initiate while this screen is up.
++            isBusy = true; isBusyWithAutomatic = true
++        case .inProgress(let dose):
++            isBusy = true; isBusyWithAutomatic = dose.automatic == true
++        case .canceling:
++            isBusy = true; isBusyWithAutomatic = false
++        }
++        var notReady: String?
++        var suspended = false
++        switch status.basalDeliveryState {
++        case .suspending, .suspended:
++            suspended = true; notReady = "pod is suspended"
++        case .resuming:
++            notReady = "pod is resuming"
++        case .pumpInoperable:
++            notReady = "pod is not working"
++        case nil:
++            notReady = "pod state unknown"
++        default:
++            break
++        }
++        return .init(hasPod: loopDataManager.deliveryDelegate?.isPumpConfigured == true, isSuspended: suspended,
++                     isBusy: isBusy, isBusyWithAutomaticDelivery: isBusyWithAutomatic, notReadyReason: notReady)
++    }
++
++    /// Units of the automatic bolus running now, when a manual bolus could queue behind it (nil units while initiating).
++    func automaticDeliveryInProgress() -> (units: Double?, busy: Bool) {
++        guard isEnabled, queued == nil else { return (nil, false) }
++        let pod = podSnapshot
++        guard pod.hasPod, !pod.isSuspended, pod.isBusyWithAutomaticDelivery else { return (nil, false) }
++        if case .inProgress(let dose)? = loopDataManager.deliveryDelegate?.pumpManagerStatus?.bolusState {
++            return (dose.programmedUnits, true)
++        }
++        return (nil, true)
++    }
++
++    func enqueue(units: Double, decisionId: UUID?, activationType: BolusActivationType) throws {
++        let item = try queue.enqueue(units: units, decisionId: decisionId, activationTypeRawValue: activationType.rawValue,
++                                     at: Date(), pod: podSnapshot)
++        queued = item
++        log.default("Queued %{public}@ U behind the automatic bolus", String(item.units))
++        startPolling()
++    }
++
++    func cancel() {
++        if let item = queue.cancel() {
++            log.default("Canceled queued %{public}@ U", String(item.units))
++        }
++        queued = nil
++        pollTask?.cancel()
++        pollTask = nil
++    }
++
++    private func startPolling() {
++        pollTask?.cancel()
++        pollTask = Task { @MainActor [weak self] in
++            while !Task.isCancelled {
++                guard let self, self.queued != nil else { return }
++                await self.poll()
++                try? await Task.sleep(nanoseconds: UInt64(Self.pollInterval * 1_000_000_000))
++            }
++        }
++    }
++
++    private func poll() async {
++        guard isEnabled else {
++            // The setting was turned off while something was queued: drop it, give nothing.
++            if let item = queue.cancel() {
++                Self.notify("Queued \(Self.units(item.units)) canceled", "The bolus queue was turned off. Nothing was delivered.")
++            }
++            queued = nil
++            return
++        }
++        let pod = podSnapshot
++        let early = queue.checkExpiry(now: Date())
++        if case .expired(let item) = early {
++            finish(.expired(item))
++            return
++        }
++        guard !pod.isBusy else { return }
++
++        let check = await deliveryCheck(for: queue.item?.units ?? 0)
++        finish(queue.stepWhenFree(now: Date(), check: check))
++    }
++
++    private func deliveryCheck(for units: Double) async -> ManualBolusQueue.DeliveryCheck {
++        // Refresh from the stores so IOB includes the automatic bolus that just finished.
++        await loopDataManager.updateDisplayState()
++        var check = ManualBolusQueue.DeliveryCheck(
++            maximumBolus: loopDataManager.maximumBolus,
++            activeInsulin: loopDataManager.displayState.activeInsulin?.value,
++            suspendThreshold: loopDataManager.suspendThreshold?.doubleValue(for: .milligramsPerDeciliter),
++            pod: podSnapshot)
++        do {
++            let now = Date()
++            let insulinModel = loopDataManager.insulinModel(for: loopDataManager.deliveryDelegate?.pumpInsulinType)
++            let dose = SimpleInsulinDose(deliveryType: .bolus, automatic: false, startDate: now, endDate: now, volume: units,
++                                         insulinModel: AlgorithmInsulinModel(insulinModel))
++            let (glucose, forecast) = try await loopDataManager.generatePrediction(carbEntryChange: nil, potentialDose: dose, manualGlucose: nil)
++            check.latestGlucose = glucose.last?.quantity.doubleValue(for: .milligramsPerDeciliter)
++            check.latestGlucoseDate = glucose.last?.startDate
++            check.minimumForecastWithDose = forecast.map { $0.quantity.doubleValue(for: .milligramsPerDeciliter) }.min()
++        } catch {
++            log.error("Queued bolus check could not forecast: %{public}@", String(describing: error))
++        }
++        return check
++    }
++
++    private func finish(_ step: ManualBolusQueue.Step) {
++        switch step {
++        case .idle, .waiting:
++            return
++        case .expired(let item):
++            log.default("Queued %{public}@ U expired", String(item.units))
++            Self.notify("Queued \(Self.units(item.units)) not given", "The pod was still busy 10 minutes after you queued it. Nothing was delivered.")
++        case .notGiven(let item, let failure):
++            log.default("Queued %{public}@ U not given: %{public}@", String(item.units), ManualBolusQueue.describe(failure))
++            Self.notify("Queued \(Self.units(item.units)) not given", "\(ManualBolusQueue.describe(failure).prefix(1).uppercased())\(ManualBolusQueue.describe(failure).dropFirst()). Nothing was delivered.")
++        case .deliver(let item):
++            let activationType = BolusActivationType(rawValue: item.activationTypeRawValue) ?? .manualNoRecommendation
++            log.default("Sending queued %{public}@ U", String(item.units))
++            Task { @MainActor in
++                // The normal manual-bolus path: dose metadata, pump manager, dose store, uploads, IOB. A pump error
++                // there raises Loop's own "Bolus Issue" notification; this one says only that it was sent.
++                try? await self.loopDataManager.enactBolus(
++                    units: item.units,
++                    metadata: DoseMetadata(origin: .user, device: .phone, decisionId: item.decisionId),
++                    activationType: activationType.isAutomatic ? .manualNoRecommendation : activationType)
++                Self.notify("Queued \(Self.units(item.units)) sent to pod", "Sent after Loop's automatic bolus finished. If the pod refused it, Loop shows a Bolus Issue notification.")
++            }
++        }
++        queued = queue.item
++        if queued == nil {
++            pollTask?.cancel()
++            pollTask = nil
++        }
++    }
++
++    private static func units(_ value: Double) -> String {
++        let formatter = NumberFormatter()
++        formatter.minimumFractionDigits = 1
++        formatter.maximumFractionDigits = 2
++        formatter.minimumIntegerDigits = 1
++        return "\(formatter.string(from: NSNumber(value: value)) ?? String(value)) U"
++    }
++
++    private static var topViewController: UIViewController? {
++        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive }),
++              var top = scene.windows.first(where: \.isKeyWindow)?.rootViewController else {
++            return nil
++        }
++        while let presented = top.presentedViewController {
++            top = presented
++        }
++        return top
++    }
++
++    /// One-button notice over the top-most screen.
++    static func inform(title: String, message: String) async {
++        guard let presenter = topViewController else { return }
++        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
++            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in continuation.resume() })
++            presenter.present(alert, animated: true)
++        }
++    }
++
++    /// Yes/No question over the top-most screen. No screen -> No.
++    static func confirm(message: String) async -> Bool {
++        guard let presenter = topViewController else { return false }
++        return await withCheckedContinuation { continuation in
++            let alert = UIAlertController(title: "Pod is busy", message: message, preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "No", style: .cancel) { _ in continuation.resume(returning: false) })
++            alert.addAction(UIAlertAction(title: "Yes", style: .default) { _ in continuation.resume(returning: true) })
++            presenter.present(alert, animated: true)
++        }
++    }
++
++    private static func notify(_ title: String, _ body: String) {
++        let content = UNMutableNotificationContent()
++        content.title = title
++        content.body = body
++        content.sound = .default
++        let request = UNNotificationRequest(identifier: "com.fenix.manualBolusQueue.\(UUID().uuidString)", content: content, trigger: nil)
++        UNUserNotificationCenter.current().add(request)
++    }
++}
+diff --git a/Loop/Loop/View Controllers/StatusTableViewController.swift b/Loop/Loop/View Controllers/StatusTableViewController.swift
+index 9991db6..208a68d 100644
+--- a/Loop/Loop/View Controllers/StatusTableViewController.swift	
++++ b/Loop/Loop/View Controllers/StatusTableViewController.swift	
+@@ -209,6 +209,16 @@ final class StatusTableViewController: LoopChartsTableViewController {
+             }
+             .store(in: &cancellables)
+         
++        // Fenix: show / hide the queued manual bolus row.
++        loopManager.fenixManualBolusQueue.$queued
++            .removeDuplicates()
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in
++                guard let self, self.isViewLoaded else { return }
++                self.updateBannerAndHUDandStatusRows(statusRowMode: self.determineStatusRowMode(), newSize: nil, animated: true)
++            }
++            .store(in: &cancellables)
++
+         loopManager.$publishedMostRecentPumpDataDate
+             .receive(on: DispatchQueue.main)
+             .sink { [weak self] mostRecentPumpDataDate in
+@@ -779,6 +789,8 @@ final class StatusTableViewController: LoopChartsTableViewController {
+         case pumpSuspended(resuming: Bool)
+         case onboardingSuspended
+         case recommendManualGlucoseEntry
++        /// Fenix: a manual bolus queued behind Loop's automatic bolus.
++        case queuedBolus(units: Double)
+ 
+         var hasRow: Bool {
+             switch self {
+@@ -818,6 +830,9 @@ final class StatusTableViewController: LoopChartsTableViewController {
+             statusRowMode = .pumpSuspended(resuming: false)
+         } else if case .resuming = basalDeliveryState {
+             statusRowMode = .pumpSuspended(resuming: true)
++        } else if let queued = loopManager.fenixManualBolusQueue.queued {
++            // Fenix: above the automatic bolus's progress row, so the queued bolus is always visible and cancelable.
++            statusRowMode = .queuedBolus(units: queued.units)
+         } else if case .inProgress(let dose) = bolusState, bolusProgressReporter?.progress.isComplete == false {
+             // the isComplete check should be tested on DIY
+             statusRowMode = .bolusing(dose: dose)
+@@ -1187,6 +1202,23 @@ final class StatusTableViewController: LoopChartsTableViewController {
+                     let cell = tableView.dequeueReusableCell(withIdentifier: RecentGlucoseTableViewCell.className, for: indexPath) as! RecentGlucoseTableViewCell
+                     cell.selectionStyle = .default
+                     return cell
++                case .queuedBolus(let units):
++                    let cell = tableView.dequeueReusableCell(withIdentifier: IconTitleSubtitleTableViewCell.className, for: indexPath) as! IconTitleSubtitleTableViewCell
++                    cell.selectionStyle = .default
++                    cell.backgroundColor = .secondarySystemBackground
++                    cell.iconImageView.image = UIImage(systemName: "clock.arrow.circlepath")
++                    cell.iconImageView.tintColor = .insulinTintColor
++                    cell.iconImageView.contentMode = .scaleAspectFit
++                    cell.iconImageView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 28)
++                    let amount = insulinFormatter.string(from: LoopQuantity(unit: .internationalUnit, doubleValue: units)) ?? "\(units) U"
++                    cell.titleLabel.text = "Queued: \(amount), after current delivery"
++                    cell.titleLabel.textColor = .label
++                    cell.titleLabel.font = .systemFont(ofSize: 15, weight: .bold)
++                    cell.subtitleLabel.text = "Tap to cancel"
++                    cell.subtitleLabel.textColor = .secondaryLabel
++                    cell.subtitleLabel.font = .systemFont(ofSize: 15, weight: .bold)
++                    cell.accessoryView = nil
++                    return cell
+                 }
+             }
+         }
+@@ -1379,6 +1411,10 @@ final class StatusTableViewController: LoopChartsTableViewController {
+                     onboardingManager.resume()
+                 case .recommendManualGlucoseEntry:
+                     presentBolusEntryView(enableManualGlucoseEntry: true)
++                case .queuedBolus:
++                    // Fenix: one tap cancels the queued bolus.
++                    loopManager.fenixManualBolusQueue.cancel()
++                    updateBannerAndHUDandStatusRows(statusRowMode: determineStatusRowMode(), newSize: nil, animated: true)
+                 default:
+                     break
+                 }
+diff --git a/Loop/Loop/View Models/BolusEntryViewModel.swift b/Loop/Loop/View Models/BolusEntryViewModel.swift
+index be4f9ac..b904974 100644
+--- a/Loop/Loop/View Models/BolusEntryViewModel.swift	
++++ b/Loop/Loop/View Models/BolusEntryViewModel.swift	
+@@ -52,6 +52,13 @@ protocol BolusEntryViewModelDelegate: AnyObject {
+ 
+     var activeInsulin: InsulinValue? { get }
+     var activeCarbs: CarbValue? { get }
++
++    /// Fenix: the manual bolus queue, when this delegate has one (nil = stock behavior).
++    var manualBolusQueue: ManualBolusQueueController? { get }
++}
++
++extension BolusEntryViewModelDelegate {
++    var manualBolusQueue: ManualBolusQueueController? { nil }
+ }
+ 
+ @MainActor
+@@ -90,6 +97,11 @@ final class BolusEntryViewModel: ObservableObject {
+         }
+     }
+ 
++    /// Fenix: asks "Queue your X U to go right after it?" -- true for Yes. Shown over whatever is on screen.
++    var queueConfirmationHandler: (String) async -> Bool = { message in
++        await ManualBolusQueueController.confirm(message: message)
++    }
++
+     // MARK: - State
+ 
+     @Published var glucoseValues: [GlucoseValue] = [] // stored glucose values + manual glucose entry
+@@ -400,6 +412,35 @@ final class BolusEntryViewModel: ObservableObject {
+         let now = self.now()
+         await delegate.storeManualBolusDosingDecision(dosingDecision, withDate: now)
+ 
++        // Fenix: manual bolus queue (setting default off). Only when the pod is busy with Loop's automatic bolus.
++        if amountToDeliver > 0, let queue = delegate.manualBolusQueue {
++            if let waiting = queue.queued {
++                // One queued bolus at a time, and no second manual bolus on top of a queued one.
++                await ManualBolusQueueController.inform(title: "Bolus already queued", message: "\(formatBolusAmount(waiting.units)) U is already queued. Nothing more was given. Cancel the queued bolus on the status screen first.")
++                return true
++            }
++            let busy = queue.automaticDeliveryInProgress()
++            if busy.busy {
++                let running = busy.units.map { "Loop is delivering \(formatBolusAmount($0)) U right now." } ?? "Loop is starting an automatic bolus right now."
++                let message = "\(running) Queue your \(amountToDeliverString) U to go right after it?"
++                guard await queueConfirmationHandler(message) else {
++                    // No: nothing is given (stock would cancel Loop's bolus and send this one).
++                    return true
++                }
++                do {
++                    savedPreMealOverride = nil
++                    try queue.enqueue(units: amountToDeliver, decisionId: dosingDecision.id, activationType: activationType)
++                    return true
++                } catch ManualBolusQueue.QueueRefusal.notBusyWithAutomaticDelivery {
++                    // The pod finished while the question was up: give it now, the normal way (below).
++                } catch {
++                    log.error("Could not queue bolus: %{public}@", String(describing: error))
++                    await ManualBolusQueueController.inform(title: "Not queued", message: "Your \(amountToDeliverString) U was not queued (\(error)). Nothing was given.")
++                    return true
++                }
++            }
++        }
++
+         if amountToDeliver > 0 {
+             savedPreMealOverride = nil
+             do {
+diff --git a/Loop/Loop/Views/SettingsView.swift b/Loop/Loop/Views/SettingsView.swift
+index 0d0e1ac..ea9e723 100644
+--- a/Loop/Loop/Views/SettingsView.swift
++++ b/Loop/Loop/Views/SettingsView.swift
+@@ -63,6 +63,8 @@ struct SettingsView: View {
+     @State private var sheet: Destination.Sheet?
+     @State private var pluginSelection: (() -> Void)?
+     @State private var setupChange: SetupChange?
++    /// Fenix: manual bolus queue, default off.
++    @AppStorage(ManualBolusQueueController.enabledKey) private var queueManualBolusWhenPodBusy = false
+     
+     var localizedAppNameAndVersion: String
+ 
+@@ -111,6 +113,8 @@ struct SettingsView: View {
+                         item.view
+                     }
+ 
++                    fenixBolusQueueSection
++
+                     supportSection
+ 
+                     if let profileExpiration = BuildDetails.default.profileExpiration, FeatureFlags.profileExpirationSettingsViewEnabled {
+@@ -266,6 +270,14 @@ extension SettingsView {
+         }
+     }
+ 
++    /// Fenix: "Queue manual bolus when pod is busy" (default off).
++    private var fenixBolusQueueSection: some View {
++        Section(header: SectionHeader(label: "Manual Bolus"),
++                footer: Text("When Loop is giving an automatic bolus and you bolus, Loop asks to queue yours to go right after it. It is checked again before it goes (max bolus, IOB limit, glucose and forecast vs. the safety limit, pod state) and is never given more than 10 minutes after you queue it. Off: standard behavior.")) {
++            Toggle("Queue manual bolus when pod is busy", isOn: $queueManualBolusWhenPodBusy)
++        }
++    }
++
+     private var dosingStrategySection: some View {
+         Section(header: SectionHeader(label: NSLocalizedString("Dosing Strategy", comment: "The title of the Dosing Strategy section in settings"))) {
+             
+diff --git a/Loop/LoopTests/Managers/LoopDataManagerTests.swift b/Loop/LoopTests/Managers/LoopDataManagerTests.swift
+index 075aeca..8b8b5c5 100644
+--- a/Loop/LoopTests/Managers/LoopDataManagerTests.swift
++++ b/Loop/LoopTests/Managers/LoopDataManagerTests.swift
+@@ -795,3 +795,122 @@ extension StoredCarbEntry {
+         )
+     }
+ }
++
++// FENIX-QUEUE-TESTS-BEGIN
++// Fenix: manual bolus queue state machine (queue, deliver, expire, cancel, guard-fail).
++final class ManualBolusQueueTests: XCTestCase {
++    private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
++
++    private func pod(busy: Bool = true, automatic: Bool = true, hasPod: Bool = true, suspended: Bool = false,
++                     notReady: String? = nil) -> ManualBolusQueue.PodSnapshot {
++        .init(hasPod: hasPod, isSuspended: suspended, isBusy: busy, isBusyWithAutomaticDelivery: busy && automatic, notReadyReason: notReady)
++    }
++
++    private func goodCheck(at date: Date, pod: ManualBolusQueue.PodSnapshot? = nil) -> ManualBolusQueue.DeliveryCheck {
++        .init(maximumBolus: 10, activeInsulin: 2, suspendThreshold: 75, latestGlucose: 180, latestGlucoseDate: date.addingTimeInterval(-120),
++              minimumForecastWithDose: 110, pod: pod ?? self.pod(busy: false))
++    }
++
++    private func queued(_ units: Double = 1.0) throws -> ManualBolusQueue {
++        var queue = ManualBolusQueue()
++        try queue.enqueue(units: units, decisionId: nil, activationTypeRawValue: "manualNoRecommendation", at: t0, pod: pod())
++        return queue
++    }
++
++    func testQueueThenDeliverWhenPodIsFree() throws {
++        var queue = try queued()
++        XCTAssertEqual(queue.checkExpiry(now: t0 + 30), .waiting(queue.item!))
++        XCTAssertEqual(queue.stepWhenFree(now: t0 + 60, check: goodCheck(at: t0 + 60, pod: pod(busy: true))), .waiting(queue.item!))
++        let item = queue.item!
++        XCTAssertEqual(queue.stepWhenFree(now: t0 + 90, check: goodCheck(at: t0 + 90)), .deliver(item))
++        XCTAssertNil(queue.item, "one attempt only")
++        XCTAssertEqual(queue.stepWhenFree(now: t0 + 95, check: goodCheck(at: t0 + 95)), .idle)
++    }
++
++    func testOnlyOneAtATime() throws {
++        var queue = try queued()
++        XCTAssertThrowsError(try queue.enqueue(units: 2, decisionId: nil, activationTypeRawValue: "x", at: t0, pod: pod())) {
++            XCTAssertEqual($0 as? ManualBolusQueue.QueueRefusal, .alreadyQueued)
++        }
++    }
++
++    func testNeverQueuesWhenSuspendedNoPodOrNotBusyWithAutomatic() {
++        let cases: [(ManualBolusQueue.PodSnapshot, ManualBolusQueue.QueueRefusal)] = [
++            (pod(suspended: true), .suspended),
++            (pod(hasPod: false), .noPod),
++            (pod(busy: false), .notBusyWithAutomaticDelivery),
++            (pod(busy: true, automatic: false), .notBusyWithAutomaticDelivery),
++        ]
++        for (snapshot, refusal) in cases {
++            var queue = ManualBolusQueue()
++            XCTAssertThrowsError(try queue.enqueue(units: 1, decisionId: nil, activationTypeRawValue: "x", at: t0, pod: snapshot)) {
++                XCTAssertEqual($0 as? ManualBolusQueue.QueueRefusal, refusal)
++            }
++            XCTAssertNil(queue.item)
++        }
++        var queue = ManualBolusQueue()
++        XCTAssertThrowsError(try queue.enqueue(units: 0, decisionId: nil, activationTypeRawValue: "x", at: t0, pod: pod()))
++    }
++
++    func testExpiresAfterTenMinutesAndIsNeverDeliveredLate() throws {
++        var queue = try queued()
++        let item = queue.item!
++        XCTAssertEqual(queue.checkExpiry(now: t0 + 599), .waiting(item))
++        XCTAssertEqual(queue.checkExpiry(now: t0 + 600), .expired(item))
++        XCTAssertNil(queue.item)
++
++        var late = try queued()
++        XCTAssertEqual(late.stepWhenFree(now: t0 + 601, check: goodCheck(at: t0 + 601)), .expired(item))
++    }
++
++    func testCancel() throws {
++        var queue = try queued()
++        XCTAssertEqual(queue.cancel()?.units, 1.0)
++        XCTAssertNil(queue.item)
++        XCTAssertEqual(queue.stepWhenFree(now: t0 + 60, check: goodCheck(at: t0 + 60)), .idle)
++        XCTAssertNil(queue.cancel())
++    }
++
++    func testGuardFailuresAreNotGivenAndNeverShrunk() throws {
++        let now = t0 + 60
++        var check: ManualBolusQueue.DeliveryCheck
++
++        func expect(_ check: ManualBolusQueue.DeliveryCheck, _ failure: ManualBolusQueue.GuardFailure, units: Double = 1.0, line: UInt = #line) throws {
++            var queue = try queued(units)
++            let item = queue.item!
++            XCTAssertEqual(queue.stepWhenFree(now: now, check: check), .notGiven(item, failure), line: line)
++            XCTAssertNil(queue.item, line: line)
++        }
++
++        check = goodCheck(at: now); check.maximumBolus = 0.5
++        try expect(check, .aboveMaximumBolus(maximum: 0.5))
++        check = goodCheck(at: now); check.maximumBolus = nil
++        try expect(check, .noMaximumBolus)
++        // IOB limit = 2 x max bolus, counting the automatic bolus that just finished.
++        check = goodCheck(at: now); check.maximumBolus = 3; check.activeInsulin = 5.5
++        try expect(check, .aboveActiveInsulinLimit(activeInsulin: 5.5, limit: 6))
++        check = goodCheck(at: now); check.activeInsulin = nil
++        try expect(check, .activeInsulinUnavailable)
++        check = goodCheck(at: now); check.latestGlucose = 70
++        try expect(check, .glucoseBelowSuspendThreshold(glucose: 70, threshold: 75))
++        check = goodCheck(at: now); check.latestGlucoseDate = now - 16 * 60
++        try expect(check, .glucoseUnavailable)
++        check = goodCheck(at: now); check.minimumForecastWithDose = 74
++        try expect(check, .forecastBelowSuspendThreshold(forecast: 74, threshold: 75))
++        check = goodCheck(at: now); check.minimumForecastWithDose = nil
++        try expect(check, .forecastUnavailable)
++        check = goodCheck(at: now); check.suspendThreshold = nil
++        try expect(check, .noSuspendThreshold)
++        check = goodCheck(at: now, pod: pod(busy: false, notReady: "pod is suspended"))
++        try expect(check, .podNotReady("pod is suspended"))
++    }
++
++    func testExactLimitsPass() throws {
++        let now = t0 + 60
++        var check = goodCheck(at: now); check.maximumBolus = 1; check.activeInsulin = 1; check.minimumForecastWithDose = 75
++        var queue = try queued(1)
++        let item = queue.item!
++        XCTAssertEqual(queue.stepWhenFree(now: now, check: check), .deliver(item))
++    }
++}
++// FENIX-QUEUE-TESTS-END
