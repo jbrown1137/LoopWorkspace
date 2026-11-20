@@ -343,7 +343,7 @@ index 185779a..ed36fd8 100644
 +            let (glucose, forecast) = try await loopDataManager.generatePrediction(carbEntryChange: nil, potentialDose: dose, manualGlucose: nil)
 +            check.latestGlucose = glucose.last?.quantity.doubleValue(for: .milligramsPerDeciliter)
 +            check.latestGlucoseDate = glucose.last?.startDate
-+            check.minimumForecastWithDose = forecast.map { $0.mgdl }.min()
++            check.minimumForecastWithDose = forecast.map { $0.quantity.doubleValue(for: .milligramsPerDeciliter) }.min()
 +        } catch {
 +            log.error("Queued bolus check could not forecast: %{public}@", String(describing: error))
 +        }
