@@ -1,0 +1,364 @@
+Fenix telemetry (no dosing change): Loop uploads what the algorithm used to Nightscout devicestatus loop.testingDetails.
+LoopAlgorithm e692e77, LoopKit f6b3646, Loop 6990c67, NightscoutService ec192c8. Remove this file to remove the feature.
+
+diff --git a/LoopAlgorithm/Sources/LoopAlgorithm/LoopAlgorithm.swift b/LoopAlgorithm/Sources/LoopAlgorithm/LoopAlgorithm.swift
+index 8d84b1e..5b6f23b 100644
+--- a/LoopAlgorithm/Sources/LoopAlgorithm/LoopAlgorithm.swift
++++ b/LoopAlgorithm/Sources/LoopAlgorithm/LoopAlgorithm.swift
+@@ -29,6 +29,12 @@ public struct LoopAlgorithmEffects<CarbStatusType: CarbEntry> {
+     public var retrospectiveGlucoseDiscrepancies: [GlucoseChange]
+     /// In mg/dL
+     public var totalRetrospectiveCorrectionEffect: Double?
++    /// Fenix telemetry: true when momentum was part of the forecast (nil when no prediction was made).
++    /// Momentum is dropped when the 15-min window holds display-only (calibration-flagged) samples,
++    /// is not continuous, has a jump, or mixes sources, or when positive momentum is turned off.
++    public var momentumApplied: Bool?
++    /// Fenix telemetry: true when retrospective correction was part of the forecast (nil when no prediction was made).
++    public var retrospectiveCorrectionApplied: Bool?
+ 
+     public init(
+         insulin: [GlucoseEffect],
+@@ -38,7 +44,9 @@ public struct LoopAlgorithmEffects<CarbStatusType: CarbEntry> {
+         momentum: [GlucoseEffect],
+         insulinCounteraction: [GlucoseEffectVelocity],
+         retrospectiveGlucoseDiscrepancies: [GlucoseChange],
+-        totalRetrospectiveCorrectionEffect: Double? = nil
++        totalRetrospectiveCorrectionEffect: Double? = nil,
++        momentumApplied: Bool? = nil,
++        retrospectiveCorrectionApplied: Bool? = nil
+     ) {
+         self.insulin = insulin
+         self.carbs = carbs
+@@ -48,6 +56,8 @@ public struct LoopAlgorithmEffects<CarbStatusType: CarbEntry> {
+         self.insulinCounteraction = insulinCounteraction
+         self.retrospectiveGlucoseDiscrepancies = retrospectiveGlucoseDiscrepancies
+         self.totalRetrospectiveCorrectionEffect = totalRetrospectiveCorrectionEffect
++        self.momentumApplied = momentumApplied
++        self.retrospectiveCorrectionApplied = retrospectiveCorrectionApplied
+     }
+ }
+ 
+@@ -63,6 +73,8 @@ extension LoopAlgorithmEffects<FixtureCarbEntry>: Codable {
+         self.retrospectiveGlucoseDiscrepancies = try container.decode([GlucoseChange].self, forKey: .retrospectiveGlucoseDiscrepancies)
+ 
+         self.totalRetrospectiveCorrectionEffect = try container.decodeIfPresent(Double.self, forKey: .totalRetrospectiveCorrectionEffect)
++        self.momentumApplied = try container.decodeIfPresent(Bool.self, forKey: .momentumApplied)
++        self.retrospectiveCorrectionApplied = try container.decodeIfPresent(Bool.self, forKey: .retrospectiveCorrectionApplied)
+     }
+ 
+     public func encode(to encoder: Encoder) throws {
+@@ -75,6 +87,8 @@ extension LoopAlgorithmEffects<FixtureCarbEntry>: Codable {
+         try container.encode(insulinCounteraction, forKey: .insulinCounteraction)
+         try container.encode(retrospectiveGlucoseDiscrepancies, forKey: .retrospectiveGlucoseDiscrepancies)
+         try container.encodeIfPresent(totalRetrospectiveCorrectionEffect, forKey: .totalRetrospectiveCorrectionEffect)
++        try container.encodeIfPresent(momentumApplied, forKey: .momentumApplied)
++        try container.encodeIfPresent(retrospectiveCorrectionApplied, forKey: .retrospectiveCorrectionApplied)
+     }
+ 
+     private enum CodingKeys: String, CodingKey {
+@@ -86,6 +100,8 @@ extension LoopAlgorithmEffects<FixtureCarbEntry>: Codable {
+         case insulinCounteraction
+         case retrospectiveGlucoseDiscrepancies
+         case totalRetrospectiveCorrectionEffect
++        case momentumApplied
++        case retrospectiveCorrectionApplied
+     }
+ }
+ 
+@@ -230,6 +246,9 @@ public struct Algorithm {
+         var insulinCounteractionEffects: [GlucoseEffectVelocity] = []
+         var retrospectiveGlucoseDiscrepanciesSummed: [GlucoseChange] = []
+         var totalRetrospectiveCorrectionEffect: LoopQuantity?
++        // Fenix telemetry (additive, no effect on dosing): which effects entered the forecast.
++        var momentumApplied: Bool?
++        var retrospectiveCorrectionApplied: Bool?
+         var activeInsulin: Double?
+         var activeCarbs: Double?
+         //var carbStatus: [CarbStatus] = []
+@@ -369,6 +388,7 @@ public struct Algorithm {
+                         useRC = false
+                     }
+                 
++                retrospectiveCorrectionApplied = useRC
+                 if useRC {
+                     effects.append(retrospectiveCorrectionEffects)
+                 }
+@@ -387,6 +407,9 @@ public struct Algorithm {
+                 useMomentum = false
+             }
+ 
++            // Fenix telemetry: whether momentum actually entered this forecast.
++            momentumApplied = useMomentum && !momentumEffects.isEmpty
++
+             prediction = LoopMath.predictGlucose(
+                 startingAt: latestGlucose,
+                 momentum: useMomentum ? momentumEffects : [],
+@@ -411,7 +434,9 @@ public struct Algorithm {
+                 momentum: momentumEffects,
+                 insulinCounteraction: insulinCounteractionEffects,
+                 retrospectiveGlucoseDiscrepancies: retrospectiveGlucoseDiscrepanciesSummed,
+-                totalRetrospectiveCorrectionEffect: totalRetrospectiveCorrectionEffect?.doubleValue(for: .milligramsPerDeciliter)
++                totalRetrospectiveCorrectionEffect: totalRetrospectiveCorrectionEffect?.doubleValue(for: .milligramsPerDeciliter),
++                momentumApplied: momentumApplied,
++                retrospectiveCorrectionApplied: retrospectiveCorrectionApplied
+             ),
+             dosesRelativeToBasal: dosesRelativeToBasal,
+             activeInsulin: activeInsulin,
+@@ -587,6 +612,9 @@ public struct Algorithm {
+         var retrospectiveCorrectionEffects: [GlucoseEffect] = []
+         var momentumEffects: [GlucoseEffect] = []
+         var totalRetrospectiveCorrectionEffect: LoopQuantity?
++        // Fenix telemetry (additive, no effect on dosing): which effects entered the forecast.
++        var momentumApplied: Bool?
++        var retrospectiveCorrectionApplied: Bool?
+ 
+         if let latestGlucose = glucoseHistory.last {
+             var integralClamp: IntegralRCClampSettings?
+@@ -627,6 +655,7 @@ public struct Algorithm {
+                     useRC = false
+                 }
+                 if useRC { effects.append(retrospectiveCorrectionEffects) }
++                retrospectiveCorrectionApplied = useRC
+             }
+ 
+             var useMomentum = true
+@@ -644,6 +673,8 @@ public struct Algorithm {
+                 useMomentum = false
+             }
+ 
++            // Fenix telemetry: whether momentum actually entered this forecast.
++            momentumApplied = useMomentum && !momentumEffects.isEmpty
+             prediction = LoopMath.predictGlucose(
+                 startingAt: latestGlucose,
+                 momentum: useMomentum ? momentumEffects : [],
+@@ -666,7 +697,9 @@ public struct Algorithm {
+                 momentum: momentumEffects,
+                 insulinCounteraction: insulinCounteractionEffects,
+                 retrospectiveGlucoseDiscrepancies: retrospectiveGlucoseDiscrepanciesSummed,
+-                totalRetrospectiveCorrectionEffect: totalRetrospectiveCorrectionEffect?.doubleValue(for: .milligramsPerDeciliter)
++                totalRetrospectiveCorrectionEffect: totalRetrospectiveCorrectionEffect?.doubleValue(for: .milligramsPerDeciliter),
++                momentumApplied: momentumApplied,
++                retrospectiveCorrectionApplied: retrospectiveCorrectionApplied
+             ),
+             dosesRelativeToBasal: dosesRelativeToBasal,
+             activeInsulin: activeInsulin,
+diff --git a/LoopAlgorithm/Tests/LoopAlgorithmTests/LoopAlgorithmTests.swift b/LoopAlgorithm/Tests/LoopAlgorithmTests/LoopAlgorithmTests.swift
+index 152ee7a..dd36145 100644
+--- a/LoopAlgorithm/Tests/LoopAlgorithmTests/LoopAlgorithmTests.swift
++++ b/LoopAlgorithm/Tests/LoopAlgorithmTests/LoopAlgorithmTests.swift
+@@ -217,6 +217,39 @@ final class LoopAlgorithmTests: XCTestCase {
+ 
+     }
+ 
++    // Fenix telemetry: the effects record whether momentum and RC entered the forecast.
++    func testEffectsReportMomentumAndRCApplied() {
++        let base = ISO8601DateFormatter().date(from: "2024-01-03T12:00:00+0000")!
++
++        var input = AlgorithmInputFixture.mock(for: base.addingTimeInterval(.minutes(30)))
++        input.glucoseHistory = (0...6).map { sample(at: base + .minutes(Double($0) * 5), glucose: 150 + Double($0) * 3) }
++
++        var output = Algorithm.run(input: input)
++        XCTAssertEqual(output.effects.momentumApplied, true)
++        XCTAssertEqual(output.effects.retrospectiveCorrectionApplied, true)
++        XCTAssertFalse(output.effects.momentum.isEmpty)
++
++        // A display-only (calibration-flagged) reading in the momentum window drops momentum.
++        input.glucoseHistory = (0...6).map { sample(at: base + .minutes(Double($0) * 5), glucose: 150 + Double($0) * 3, displayOnly: $0 >= 5) }
++        output = Algorithm.run(input: input)
++        XCTAssertEqual(output.effects.momentumApplied, false)
++
++        // A jump over the gradual-transitions threshold in the 30-min RC window drops RC.
++        // (It is older than the 15-min momentum window, so momentum may still apply.)
++        input.glucoseHistory = [
++            sample(at: base,                     glucose: 100),
++            sample(at: base + .minutes(5),       glucose: 115),
++            sample(at: base + .minutes(10),      glucose: 125),
++            sample(at: base + .minutes(15),      glucose: 179),
++            sample(at: base + .minutes(20),      glucose: 148),
++            sample(at: base + .minutes(25),      glucose: 158),
++            sample(at: base + .minutes(30),      glucose: 168)
++        ]
++        output = Algorithm.run(input: input)
++        XCTAssertEqual(output.effects.retrospectiveCorrectionApplied, false)
++        XCTAssertNotNil(output.effects.momentumApplied)
++    }
++
+ 
+     func testMealBolusScenario() {
+         let decoder = JSONDecoder()
+diff --git a/LoopKit/LoopKit/DosingDecisionStore.swift b/LoopKit/LoopKit/DosingDecisionStore.swift
+index f6e74dc..417eed2 100644
+--- a/LoopKit/LoopKit/DosingDecisionStore.swift
++++ b/LoopKit/LoopKit/DosingDecisionStore.swift
+@@ -331,6 +331,10 @@ public struct StoredDosingDecision: DosingDecision {
+     public var errors: [Issue]
+     /// The algorithm experiments in effect when the decision was made
+     public var algorithmExperiments: [AlgorithmExperiment]?
++    /// Fenix telemetry: what the algorithm actually used for this decision (momentum, retrospective
++    /// correction, display-only flags of the recent glucose). Free-form, informational only; never read
++    /// back for dosing. Uploaded to Nightscout as devicestatus `loop.testingDetails`.
++    public var algorithmTelemetry: JSONValue? = nil
+     public var syncIdentifier: UUID
+ 
+     public init(id: UUID = UUID(),
+@@ -490,6 +494,7 @@ extension StoredDosingDecision: Codable {
+                   errors: try container.decodeIfPresent([Issue].self, forKey: .errors) ?? [],
+                   algorithmExperiments: try container.decodeIfPresent([AlgorithmExperiment].self, forKey: .algorithmExperiments),
+                   syncIdentifier: try container.decode(UUID.self, forKey: .syncIdentifier))
++        self.algorithmTelemetry = try container.decodeIfPresent(JSONValue.self, forKey: .algorithmTelemetry)
+     }
+ 
+     public func encode(to encoder: Encoder) throws {
+@@ -521,6 +526,7 @@ extension StoredDosingDecision: Codable {
+         try container.encodeIfPresent(!warnings.isEmpty ? warnings : nil, forKey: .warnings)
+         try container.encodeIfPresent(!errors.isEmpty ? errors : nil, forKey: .errors)
+         try container.encodeIfPresent(algorithmExperiments, forKey: .algorithmExperiments)
++        try container.encodeIfPresent(algorithmTelemetry, forKey: .algorithmTelemetry)
+         try container.encode(syncIdentifier, forKey: .syncIdentifier)
+     }
+ 
+@@ -552,6 +558,7 @@ extension StoredDosingDecision: Codable {
+         case warnings
+         case errors
+         case algorithmExperiments
++        case algorithmTelemetry
+         case syncIdentifier
+     }
+ }
+diff --git a/LoopKit/LoopKitTests/DosingDecisionStoreTests.swift b/LoopKit/LoopKitTests/DosingDecisionStoreTests.swift
+index fa8c1e9..549bb90 100644
+--- a/LoopKit/LoopKitTests/DosingDecisionStoreTests.swift
++++ b/LoopKit/LoopKitTests/DosingDecisionStoreTests.swift
+@@ -1010,6 +1010,29 @@ class StoredDosingDecisionCodableTests: XCTestCase {
+         XCTAssertEqual(plistDecoded.algorithmExperiments, dosingDecision.algorithmExperiments)
+     }
+ 
++    // Fenix telemetry rides along in the stored decision and survives both encoders.
++    func testCodableAlgorithmTelemetry() throws {
++        var dosingDecision = StoredDosingDecision(date: dateFormatter.date(from: "2020-05-14T22:38:14Z")!,
++                                                  controllerTimeZone: TimeZone(identifier: "America/Los_Angeles")!,
++                                                  reason: "loop",
++                                                  syncIdentifier: UUID(uuidString: "2A67A303-5203-4CB8-8263-79498265368E")!)
++        XCTAssertNil(try decoder.decode(StoredDosingDecision.self, from: encoder.encode(dosingDecision)).algorithmTelemetry)
++
++        dosingDecision.algorithmTelemetry = .object([
++            "momentumApplied": .bool(false),
++            "momentumNet": .number(0),
++            "retrospectiveCorrectionApplied": .bool(true),
++            "retrospectiveCorrectionTotal": .number(12.5),
++            "latestGlucoseIsDisplayOnly": .bool(true),
++            "glucose": .array([.object(["date": .string("2020-05-14T22:35:00Z"), "isDisplayOnly": .bool(true)])])
++        ])
++        let decoded = try decoder.decode(StoredDosingDecision.self, from: encoder.encode(dosingDecision))
++        XCTAssertEqual(decoded.algorithmTelemetry, dosingDecision.algorithmTelemetry)
++
++        let plistDecoded = try PropertyListDecoder().decode(StoredDosingDecision.self, from: PropertyListEncoder().encode(dosingDecision))
++        XCTAssertEqual(plistDecoded.algorithmTelemetry, dosingDecision.algorithmTelemetry)
++    }
++
+     private func assertStoredDosingDecisionCodable(_ original: StoredDosingDecision, encodesJSON string: String) throws {
+         let data = try encoder.encode(original)
+         XCTAssertEqual(String(data: data, encoding: .utf8), string)
+diff --git a/Loop/LoopCore/Managers/LoopAlgorithmSupport.swift b/Loop/LoopCore/Managers/LoopAlgorithmSupport.swift
+index 9dbbce3..69a52c7 100644
+--- a/Loop/LoopCore/Managers/LoopAlgorithmSupport.swift
++++ b/Loop/LoopCore/Managers/LoopAlgorithmSupport.swift
+@@ -212,6 +212,44 @@ public extension StoredDosingDecision {
+             self.carbsOnBoard = LoopKit.CarbValue(startDate: input.predictionStart, value: activeCarbs)
+         }
+         self.predictedGlucose = output.predictedGlucose.map(\.loopKit)
++        self.algorithmTelemetry = Self.algorithmTelemetry(input: input, output: output)
++    }
++
++    /// Fenix telemetry: what this run actually used, for Nightscout (devicestatus `loop.testingDetails`).
++    /// Informational only — computed from the run's input and output after the fact and never read back for
++    /// dosing. One builder, called for both the "loop" decision and the "updateRemoteRecommendation" decision.
++    static func algorithmTelemetry(input: StoredDataAlgorithmInput, output: AlgorithmOutput<StoredCarbEntry>) -> JSONValue {
++        let effects = output.effects
++        let windowStart = input.predictionStart.addingTimeInterval(-LoopAlgorithm.LoopMath.retrospectiveCorrectionGroupingInterval)
++        let recent = input.glucoseHistory.filter { $0.startDate >= windowStart && $0.startDate <= input.predictionStart }
++        let formatter = ISO8601DateFormatter()
++
++        func number(_ value: Double?) -> JSONValue {
++            value.map { .number(($0 * 100).rounded() / 100) } ?? .null
++        }
++        func bool(_ value: Bool?) -> JSONValue {
++            value.map { .bool($0) } ?? .null
++        }
++
++        var telemetry: [String: JSONValue] = [
++            "fenixTelemetryVersion": .number(1),
++            "momentumApplied": bool(effects.momentumApplied),
++            "momentumNet": number(effects.momentum.netEffect()?.quantity.doubleValue(for: .milligramsPerDeciliter)),
++            "retrospectiveCorrectionApplied": bool(effects.retrospectiveCorrectionApplied),
++            "retrospectiveCorrectionNet": number(effects.retrospectiveCorrection.netEffect()?.quantity.doubleValue(for: .milligramsPerDeciliter)),
++            "retrospectiveCorrectionTotal": number(effects.totalRetrospectiveCorrectionEffect),
++            "includePositiveVelocityAndRC": .bool(input.includePositiveVelocityAndRC),
++            "displayOnlyCount30m": .number(Double(recent.filter(\.isDisplayOnly).count)),
++            "glucoseCount30m": .number(Double(recent.count)),
++            "glucose": .array(recent.map {
++                .object(["date": .string(formatter.string(from: $0.startDate)), "isDisplayOnly": .bool($0.isDisplayOnly)])
++            })
++        ]
++        if let latest = input.glucoseHistory.last {
++            telemetry["latestGlucoseDate"] = .string(formatter.string(from: latest.startDate))
++            telemetry["latestGlucoseIsDisplayOnly"] = .bool(latest.isDisplayOnly)
++        }
++        return .object(telemetry)
+     }
+ }
+ 
+diff --git a/Loop/LoopCore/Managers/LoopCycle.swift b/Loop/LoopCore/Managers/LoopCycle.swift
+index 4500d9f..2e47ce1 100644
+--- a/Loop/LoopCore/Managers/LoopCycle.swift
++++ b/Loop/LoopCore/Managers/LoopCycle.swift
+@@ -473,6 +473,9 @@ public final class LoopCycle {
+ 
+         var dosingDecision = StoredDosingDecision(date: now(), reason: "updateRemoteRecommendation")
+         dosingDecision.algorithmExperiments = host.algorithmExperiments(for: host.currentDosingStrategy, output: output)
++        if let input = displayState.input {
++            dosingDecision.algorithmTelemetry = StoredDosingDecision.algorithmTelemetry(input: input, output: output)
++        }
+         dosingDecision.predictedGlucose = output.predictedGlucose.map(\.loopKit)
+         dosingDecision.insulinOnBoard = displayState.activeInsulin
+         dosingDecision.carbsOnBoard = displayState.activeCarbs
+diff --git a/NightscoutService/NightscoutServiceKit/Extensions/StoredDosingDecision.swift b/NightscoutService/NightscoutServiceKit/Extensions/StoredDosingDecision.swift
+index 6b60566..0357641 100644
+--- a/NightscoutService/NightscoutServiceKit/Extensions/StoredDosingDecision.swift
++++ b/NightscoutService/NightscoutServiceKit/Extensions/StoredDosingDecision.swift
+@@ -162,6 +162,27 @@ extension StoredDosingDecision {
+         return UploaderStatus(name: uploaderDevice.name, timestamp: date, battery: battery, isCharging: isCharging, timeZone: controllerTimeZone.identifier)
+     }
+     
++    /// Fenix telemetry for devicestatus `loop.testingDetails`: the dosing ("loop") decision's when there is one,
++    /// else this decision's. `fenixTelemetrySource` says which. Extra fields only; Nightscout stores them as-is.
++    func loopStatusTestingDetails(automaticDoseDecision: StoredDosingDecision?) -> [String: Any]? {
++        let source: String
++        let telemetry: JSONValue
++        if let loopTelemetry = automaticDoseDecision?.algorithmTelemetry {
++            source = automaticDoseDecision?.reason ?? "loop"
++            telemetry = loopTelemetry
++        } else if let ownTelemetry = algorithmTelemetry {
++            source = reason
++            telemetry = ownTelemetry
++        } else {
++            return nil
++        }
++        guard var details = telemetry.jsonObject as? [String: Any] else {
++            return nil
++        }
++        details["fenixTelemetrySource"] = source
++        return details
++    }
++
+     func deviceStatus(automaticDoseDecision: StoredDosingDecision?) -> DeviceStatus {
+         return DeviceStatus(device: "loop://\(UIDevice.current.name)",
+             timestamp: date,
+@@ -179,6 +200,7 @@ extension StoredDosingDecision {
+                                    enacted: automaticDoseDecision?.loopStatusEnacted,
+                                    failureReason: automaticDoseDecision?.loopStatusFailureReason,
+                                    failureCode: automaticDoseDecision?.errors.first?.id,
++                                   testingDetails: loopStatusTestingDetails(automaticDoseDecision: automaticDoseDecision),
+                                    algorithmExperiments: (automaticDoseDecision?.algorithmExperiments ?? algorithmExperiments)?.map { $0.jsonObject }),
+             overrideStatus: overrideStatus)
+     }

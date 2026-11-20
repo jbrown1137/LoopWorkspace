@@ -1,0 +1,367 @@
+Fenix: arithmetic in the carb Amount Consumed field (28+28 -> confirm 'Enter 56 g?'). UI only.
+LoopKit f6b3646. Remove this file to remove the feature.
+
+diff --git a/LoopKit/LoopKit/CarbKit/CarbValue.swift b/LoopKit/LoopKit/CarbKit/CarbValue.swift
+index 569cc9e..24fb074 100644
+--- a/LoopKit/LoopKit/CarbKit/CarbValue.swift
++++ b/LoopKit/LoopKit/CarbKit/CarbValue.swift
+@@ -46,3 +46,154 @@ extension CarbValue: Codable {
+         case value
+     }
+ }
++
++
++// MARK: - Fenix: arithmetic in the carb amount field ("28+28")
++
++/// Evaluates simple arithmetic typed into a carb amount field, e.g. "28+28" or "2*15+(10/2)".
++///
++/// Allowed: digits, one decimal point per number ("." or the locale's separator), + - * / (also
++/// − × ÷ x X), parentheses and spaces. No unary minus, no exponents, nothing else. Anything that is not a
++/// complete, valid expression -- a trailing operator, junk, unbalanced parentheses, division by zero, a
++/// result that is not a positive finite number -- is an error and never yields a number.
++///
++/// The result is rounded to `fractionDigits` (the amount field shows 1 decimal) and rejected when it has
++/// more than `maximumIntegerDigits` integer digits (the field's own formatter limit). It is only a
++/// number: the caller confirms it with the user and then feeds it into the normal entry path, where Loop's
++/// max carb entry check and every other validation still apply.
++public enum CarbAmountExpression {
++    public enum EvaluationError: Error, Equatable {
++        case empty
++        case invalidCharacter(Character)
++        case invalidNumber
++        case incomplete
++        case unbalancedParentheses
++        case divisionByZero
++        case notPositive
++        case tooLarge
++    }
++
++    /// True when `text` contains an operator or parenthesis, i.e. is more than a plain number.
++    public static func isExpression(_ text: String) -> Bool {
++        text.contains { operatorCharacters.contains($0) || $0 == "(" || $0 == ")" }
++    }
++
++    public static func evaluate(_ text: String, fractionDigits: Int = 1, maximumIntegerDigits: Int = 3,
++                                decimalSeparator: String = Locale.current.decimalSeparator ?? ".") throws -> Double {
++        let tokens = try tokenize(text, decimalSeparator: decimalSeparator)
++        guard !tokens.isEmpty else { throw EvaluationError.empty }
++        var parser = Parser(tokens: tokens)
++        let value = try parser.parseExpression()
++        guard parser.isAtEnd else {
++            throw parser.peek == .closeParen ? EvaluationError.unbalancedParentheses : EvaluationError.incomplete
++        }
++        guard value.isFinite else { throw EvaluationError.tooLarge }
++        let scale = pow(10.0, Double(fractionDigits))
++        let rounded = (value * scale).rounded() / scale
++        guard rounded > 0 else { throw EvaluationError.notPositive }
++        guard rounded < pow(10.0, Double(maximumIntegerDigits)) else { throw EvaluationError.tooLarge }
++        return rounded
++    }
++
++    private static let operatorCharacters: Set<Character> = ["+", "-", "−", "*", "×", "x", "X", "/", "÷"]
++
++    private enum Token: Equatable {
++        case number(Double)
++        case plus, minus, times, divide
++        case openParen, closeParen
++    }
++
++    private static func tokenize(_ text: String, decimalSeparator: String) throws -> [Token] {
++        var tokens: [Token] = []
++        var numberText = ""
++
++        func flushNumber() throws {
++            guard !numberText.isEmpty else { return }
++            // Exactly digits with at most one ".", and at least one digit.
++            let parts = numberText.split(separator: ".", omittingEmptySubsequences: false)
++            guard parts.count <= 2, parts.contains(where: { !$0.isEmpty }),
++                  let value = Double(numberText), value.isFinite else {
++                throw EvaluationError.invalidNumber
++            }
++            tokens.append(.number(value))
++            numberText = ""
++        }
++
++        for character in text {
++            if character.isASCII && character.isNumber {
++                numberText.append(character)
++            } else if character == "." || String(character) == decimalSeparator {
++                numberText.append(".")
++            } else {
++                try flushNumber()
++                switch character {
++                case " ": continue
++                case "+": tokens.append(.plus)
++                case "-", "−": tokens.append(.minus)
++                case "*", "×", "x", "X": tokens.append(.times)
++                case "/", "÷": tokens.append(.divide)
++                case "(": tokens.append(.openParen)
++                case ")": tokens.append(.closeParen)
++                default: throw EvaluationError.invalidCharacter(character)
++                }
++            }
++        }
++        try flushNumber()
++        return tokens
++    }
++
++    /// expression := term (("+" | "-") term)* ; term := factor (("*" | "/") factor)* ; factor := number | "(" expression ")"
++    private struct Parser {
++        let tokens: [Token]
++        var index = 0
++
++        var isAtEnd: Bool { index >= tokens.count }
++        var peek: Token? { isAtEnd ? nil : tokens[index] }
++
++        mutating func parseExpression() throws -> Double {
++            var value = try parseTerm()
++            while let token = peek, token == .plus || token == .minus {
++                index += 1
++                let rhs = try parseTerm()
++                value = token == .plus ? value + rhs : value - rhs
++            }
++            return value
++        }
++
++        mutating func parseTerm() throws -> Double {
++            var value = try parseFactor()
++            while let token = peek, token == .times || token == .divide {
++                index += 1
++                let rhs = try parseFactor()
++                if token == .times {
++                    value *= rhs
++                } else {
++                    guard rhs != 0 else { throw EvaluationError.divisionByZero }
++                    value /= rhs
++                }
++            }
++            return value
++        }
++
++        mutating func parseFactor() throws -> Double {
++            guard let token = peek else { throw EvaluationError.incomplete }
++            switch token {
++            case .number(let value):
++                index += 1
++                return value
++            case .openParen:
++                index += 1
++                let value = try parseExpression()
++                guard peek == .closeParen else {
++                    throw isAtEnd ? EvaluationError.unbalancedParentheses : EvaluationError.incomplete
++                }
++                index += 1
++                return value
++            case .closeParen:
++                throw EvaluationError.unbalancedParentheses
++            case .plus, .minus, .times, .divide:
++                throw EvaluationError.incomplete
++            }
++        }
++    }
++}
+diff --git a/LoopKit/LoopKitTests/CarbValueTests.swift b/LoopKit/LoopKitTests/CarbValueTests.swift
+index 702a552..68172a4 100644
+--- a/LoopKit/LoopKitTests/CarbValueTests.swift
++++ b/LoopKit/LoopKitTests/CarbValueTests.swift
+@@ -48,3 +48,77 @@ class CarbValueCodableTests: XCTestCase {
+         return decoder
+     }()
+ }
++
++// Fenix: arithmetic in the carb amount field.
++class CarbAmountExpressionTests: XCTestCase {
++    private func value(_ text: String) throws -> Double {
++        try CarbAmountExpression.evaluate(text, decimalSeparator: ".")
++    }
++
++    private func assertError(_ text: String, _ expected: CarbAmountExpression.EvaluationError, file: StaticString = #filePath, line: UInt = #line) {
++        XCTAssertThrowsError(try value(text), text, file: file, line: line) { error in
++            XCTAssertEqual(error as? CarbAmountExpression.EvaluationError, expected, text, file: file, line: line)
++        }
++    }
++
++    func testSums() throws {
++        XCTAssertEqual(try value("28+28"), 56)
++        XCTAssertEqual(try value(" 28 + 28 "), 56)
++        XCTAssertEqual(try value("10+12.5+7"), 29.5)
++        XCTAssertEqual(try value("60-15"), 45)
++        XCTAssertEqual(try value("60−15"), 45)
++    }
++
++    func testPrecedenceAndParentheses() throws {
++        XCTAssertEqual(try value("2*15+10"), 40)
++        XCTAssertEqual(try value("10+2*15"), 40)
++        XCTAssertEqual(try value("(10+2)*3"), 36)
++        XCTAssertEqual(try value("2×15"), 30)
++        XCTAssertEqual(try value("2x15"), 30)
++        XCTAssertEqual(try value("45÷2"), 22.5)
++        XCTAssertEqual(try value("45/2"), 22.5)
++        XCTAssertEqual(try value("((5))"), 5)
++    }
++
++    func testRoundsLikeTheField() throws {
++        XCTAssertEqual(try value("10/3"), 3.3)
++        XCTAssertEqual(try value("20/3"), 6.7)
++        XCTAssertEqual(try value("0.25+0.25"), 0.5)
++    }
++
++    func testPlainNumberStillWorks() throws {
++        XCTAssertEqual(try value("45"), 45)
++        XCTAssertFalse(CarbAmountExpression.isExpression("45"))
++        XCTAssertFalse(CarbAmountExpression.isExpression("45.5"))
++        XCTAssertTrue(CarbAmountExpression.isExpression("28+28"))
++        XCTAssertTrue(CarbAmountExpression.isExpression("(28)"))
++    }
++
++    func testInvalidNeverGivesANumber() {
++        assertError("", .empty)
++        assertError("   ", .empty)
++        assertError("28+", .incomplete)
++        assertError("28+*2", .incomplete)
++        assertError("+28", .incomplete)
++        assertError("-5+10", .incomplete)
++        assertError("28 28", .incomplete)
++        assertError("28+abc", .invalidCharacter("a"))
++        assertError("28,5", .invalidCharacter(","))
++        assertError("1e3", .invalidCharacter("e"))
++        assertError("1.2.3", .invalidNumber)
++        assertError(".", .invalidNumber)
++        assertError("(28+2", .unbalancedParentheses)
++        assertError("28+2)", .unbalancedParentheses)
++        assertError("()", .unbalancedParentheses)
++        assertError("10/0", .divisionByZero)
++        assertError("10/(5-5)", .divisionByZero)
++        assertError("28-28", .notPositive)
++        assertError("10-20", .notPositive)
++        assertError("0.01", .notPositive)
++        assertError("999+1", .tooLarge)
++    }
++
++    func testLocaleDecimalSeparator() throws {
++        XCTAssertEqual(try CarbAmountExpression.evaluate("12,5+2,5", decimalSeparator: ","), 15)
++    }
++}
+diff --git a/LoopKit/LoopKitUI/CarbKit/CarbQuantityRow.swift b/LoopKit/LoopKitUI/CarbKit/CarbQuantityRow.swift
+index d25625f..bd4d43b 100644
+--- a/LoopKit/LoopKitUI/CarbKit/CarbQuantityRow.swift
++++ b/LoopKit/LoopKitUI/CarbKit/CarbQuantityRow.swift
+@@ -17,6 +17,8 @@ public struct CarbQuantityRow: View {
+     private let preferredCarbUnit: LoopUnit
+     
+     @State private var carbInput: String = ""
++    /// Fenix: the result of an arithmetic entry ("28+28"), waiting for the user to confirm it. Never entered on its own.
++    @State private var expressionResult: Result<Double, CarbAmountExpression.EvaluationError>?
+     
+     private let formatter: NumberFormatter = {
+         let formatter = NumberFormatter()
+@@ -34,14 +36,22 @@ public struct CarbQuantityRow: View {
+     }
+ 
+     public var body: some View {
++        VStack(alignment: .trailing, spacing: 6) {
++            entryRow
++            expressionConfirmation
++        }
++    }
++
++    private var entryRow: some View {
+         HStack(spacing: 2) {
+             Text(title)
+                 .foregroundColor(.primary)
+                 .frame(maxWidth: .infinity, alignment: .leading)
+             
+-            RowTextField(text: $carbInput, isFocused: $isFocused, maxLength: 5) {
++            // Fenix: longer field and a keyboard with + - * / ( ) for "28+28".
++            RowTextField(text: $carbInput, isFocused: $isFocused, maxLength: 30) {
+                 $0.textAlignment = .right
+-                $0.keyboardType = .decimalPad
++                $0.keyboardType = .numbersAndPunctuation
+                 $0.placeholder = "0"
+                 $0.font = .preferredFont(forTextStyle: .body)
+             }
+@@ -60,6 +70,10 @@ public struct CarbQuantityRow: View {
+             updateQuantity(with: newValue)
+         }
+         .onChange(of: quantity) { _, newQuantity in
++            // Fenix: an unconfirmed expression holds quantity at nil; don't wipe what is being typed.
++            if newQuantity == nil && CarbAmountExpression.isExpression(carbInput) {
++                return
++            }
+             updateCarbInput(with: newQuantity)
+         }
+         .onAppear {
+@@ -75,8 +89,73 @@ public struct CarbQuantityRow: View {
+             .foregroundColor(Color(.secondaryLabel))
+     }
+     
++    /// Fenix: below the field, "28+28 = 56 g" and "Enter 56 g?" (or why it can't be calculated).
++    @ViewBuilder
++    private var expressionConfirmation: some View {
++        switch expressionResult {
++        case .success(let value)?:
++            let amount = "\(formatter.string(from: NSNumber(value: value)) ?? "\(value)") \(unitString)"
++            HStack(spacing: 12) {
++                Text("\(carbInput) = \(amount)")
++                    .foregroundColor(Color(.secondaryLabel))
++                    .lineLimit(1)
++                    .minimumScaleFactor(0.7)
++                Button(String(format: LocalizedString("Enter %1$@?", comment: "Fenix: confirm entering the result of a carb arithmetic entry (1: amount with unit)"), amount)) {
++                    confirmExpression(value)
++                }
++                .buttonStyle(.borderedProminent)
++                .accessibilityIdentifier("button_ConfirmCarbExpression")
++            }
++            .font(.footnote)
++        case .failure(let error)?:
++            Text(String(format: LocalizedString("Can't calculate: %1$@. Nothing entered.", comment: "Fenix: carb arithmetic entry is invalid (1: reason)"), Self.describe(error)))
++                .font(.footnote)
++                .foregroundColor(.red)
++        case nil:
++            EmptyView()
++        }
++    }
++
++    private var unitString: String {
++        QuantityFormatter(for: preferredCarbUnit).localizedUnitStringWithPlurality()
++    }
++
++    private func confirmExpression(_ value: Double) {
++        expressionResult = nil
++        // The confirmed number goes in exactly like a typed one; the screen's own checks (max carb entry etc.) apply.
++        quantity = value
++        updateCarbInput(with: value)
++    }
++
++    private static func describe(_ error: CarbAmountExpression.EvaluationError) -> String {
++        switch error {
++        case .empty: return LocalizedString("empty", comment: "Fenix: carb arithmetic error")
++        case .invalidCharacter(let character): return String(format: LocalizedString("\"%1$@\" is not allowed", comment: "Fenix: carb arithmetic error (1: character)"), String(character))
++        case .invalidNumber: return LocalizedString("a number is not valid", comment: "Fenix: carb arithmetic error")
++        case .incomplete: return LocalizedString("incomplete", comment: "Fenix: carb arithmetic error")
++        case .unbalancedParentheses: return LocalizedString("parentheses don't match", comment: "Fenix: carb arithmetic error")
++        case .divisionByZero: return LocalizedString("divide by zero", comment: "Fenix: carb arithmetic error")
++        case .notPositive: return LocalizedString("result is not more than 0", comment: "Fenix: carb arithmetic error")
++        case .tooLarge: return LocalizedString("result is too large", comment: "Fenix: carb arithmetic error")
++        }
++    }
++
+     // Update quantity based on text field input
+     private func updateQuantity(with input: String) {
++        // Fenix: arithmetic ("28+28") is evaluated for display only; nothing is entered until confirmed.
++        if CarbAmountExpression.isExpression(input) {
++            quantity = nil
++            do {
++                expressionResult = .success(try CarbAmountExpression.evaluate(input, fractionDigits: formatter.maximumFractionDigits,
++                                                                              maximumIntegerDigits: formatter.maximumIntegerDigits))
++            } catch let error as CarbAmountExpression.EvaluationError {
++                expressionResult = .failure(error)
++            } catch {
++                expressionResult = .failure(.incomplete)
++            }
++            return
++        }
++        expressionResult = nil
+         if let number = formatter.number(from: input) {
+             quantity = number.doubleValue
+         } else {
