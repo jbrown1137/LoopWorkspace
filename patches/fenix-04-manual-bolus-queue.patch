@@ -433,17 +433,24 @@ diff --git a/Loop/Loop/View Controllers/StatusTableViewController.swift b/Loop/L
 index 9991db6..208a68d 100644
 --- a/Loop/Loop/View Controllers/StatusTableViewController.swift	
 +++ b/Loop/Loop/View Controllers/StatusTableViewController.swift	
-@@ -209,6 +209,16 @@ final class StatusTableViewController: LoopChartsTableViewController {
+@@ -209,6 +209,23 @@ final class StatusTableViewController: LoopChartsTableViewController {
              }
              .store(in: &cancellables)
          
 +        // Fenix: show / hide the queued manual bolus row.
++        // dropFirst: the publisher fires at subscribe time, before the table has loaded;
++        // a batch update then crashed Loop at launch (2026-11-21, build 25). Go through
++        // reloadData, which waits for the window and for any reload in progress.
 +        loopManager.fenixManualBolusQueue.$queued
 +            .removeDuplicates()
++            .dropFirst()
 +            .receive(on: DispatchQueue.main)
 +            .sink { [weak self] _ in
-+                guard let self, self.isViewLoaded else { return }
-+                self.updateBannerAndHUDandStatusRows(statusRowMode: self.determineStatusRowMode(), newSize: nil, animated: true)
++                Task { @MainActor in
++                    guard let self else { return }
++                    self.refreshContext.update(with: .status)
++                    await self.reloadData(animated: true)
++                }
 +            }
 +            .store(in: &cancellables)
 +
